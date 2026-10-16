@@ -1,7 +1,8 @@
 use crate::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    Address, Env, String, Vec,
+    testutils::{Address as _, Events, Ledger},
+    xdr::ContractEventBody,
+    Address, Env, String, Symbol, TryFromVal, TryIntoVal, Val, Vec,
 };
 
 #[test]
@@ -1211,4 +1212,219 @@ fn test_multiple_rollbacks_create_new_versions() {
     // Verify all versions exist
     let versions = client.list_nutrition_versions(&pet_id);
     assert_eq!(versions.len(), 5);
+}
+
+#[test]
+fn test_get_current_diet_plan_returns_latest_plan_immediately() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, KoraContract);
+    let client = KoraContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let pet_id = client.register_pet(
+        &owner,
+        &String::from_str(&env, "Milo"),
+        &String::from_str(&env, "2021-01-01"),
+        &Gender::Male,
+        &Species::Dog,
+        &String::from_str(&env, "Labrador"),
+        &String::from_str(&env, "Brown"),
+        &20u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    let empty_restrictions = Vec::new(&env);
+    let empty_allergies = Vec::new(&env);
+
+    // Initial state: no diet plans
+    assert_eq!(client.get_current_diet_plan(&pet_id), None);
+
+    // Create diet plan 1
+    client.set_diet_plan(
+        &pet_id,
+        &String::from_str(&env, "Kibble A"),
+        &String::from_str(&env, "100g"),
+        &String::from_str(&env, "Once daily"),
+        &200u32,
+        &800u32,
+        &empty_restrictions,
+        &empty_allergies,
+    );
+
+    let current1 = client.get_current_diet_plan(&pet_id).unwrap();
+    assert_eq!(current1.food_type, String::from_str(&env, "Kibble A"));
+    assert_eq!(current1.daily_target_calories, 800u32);
+
+    // Create diet plan 2
+    env.ledger().with_mut(|li| li.timestamp += 100);
+    client.set_diet_plan(
+        &pet_id,
+        &String::from_str(&env, "Kibble B"),
+        &String::from_str(&env, "150g"),
+        &String::from_str(&env, "Twice daily"),
+        &300u32,
+        &1000u32,
+        &empty_restrictions,
+        &empty_allergies,
+    );
+
+    let current2 = client.get_current_diet_plan(&pet_id).unwrap();
+    assert_eq!(current2.food_type, String::from_str(&env, "Kibble B"));
+    assert_eq!(current2.daily_target_calories, 1000u32);
+
+    // Create diet plan 3
+    env.ledger().with_mut(|li| li.timestamp += 100);
+    client.set_diet_plan(
+        &pet_id,
+        &String::from_str(&env, "Kibble C"),
+        &String::from_str(&env, "200g"),
+        &String::from_str(&env, "Twice daily"),
+        &400u32,
+        &1200u32,
+        &empty_restrictions,
+        &empty_allergies,
+    );
+
+    let current3 = client.get_current_diet_plan(&pet_id).unwrap();
+    assert_eq!(current3.food_type, String::from_str(&env, "Kibble C"));
+    assert_eq!(current3.daily_target_calories, 1200u32);
+}
+
+#[test]
+#[should_panic(expected = "InvalidInput")]
+fn test_log_feeding_rejects_zero_servings() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, KoraContract);
+    let client = KoraContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let pet_id = client.register_pet(
+        &owner,
+        &String::from_str(&env, "Charlie"),
+        &String::from_str(&env, "2020-05-15"),
+        &Gender::Male,
+        &Species::Dog,
+        &String::from_str(&env, "Poodle"),
+        &String::from_str(&env, "White"),
+        &10u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    let empty_vec = Vec::new(&env);
+    client.set_diet_plan(
+        &pet_id,
+        &String::from_str(&env, "Kibble"),
+        &String::from_str(&env, "100g"),
+        &String::from_str(&env, "Twice daily"),
+        &250u32,
+        &1000u32,
+        &empty_vec,
+        &empty_vec,
+    );
+
+    let now = env.ledger().timestamp();
+    // plan_id is 1, servings is 0 -> should panic with InvalidInput
+    client.log_feeding(&pet_id, &1u64, &0u32, &now);
+}
+
+#[test]
+fn test_log_feeding_positive_servings_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, KoraContract);
+    let client = KoraContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let pet_id = client.register_pet(
+        &owner,
+        &String::from_str(&env, "Charlie"),
+        &String::from_str(&env, "2020-05-15"),
+        &Gender::Male,
+        &Species::Dog,
+        &String::from_str(&env, "Poodle"),
+        &String::from_str(&env, "White"),
+        &10u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    let empty_vec = Vec::new(&env);
+    client.set_diet_plan(
+        &pet_id,
+        &String::from_str(&env, "Kibble"),
+        &String::from_str(&env, "100g"),
+        &String::from_str(&env, "Twice daily"),
+        &250u32,
+        &1000u32,
+        &empty_vec,
+        &empty_vec,
+    );
+
+    let now = env.ledger().timestamp();
+    let ok = client.log_feeding(&pet_id, &1u64, &2u32, &now);
+    assert!(ok);
+}
+
+#[test]
+fn test_add_weight_entry_emits_weight_recorded_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, KoraContract);
+    let client = KoraContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let pet_id = client.register_pet(
+        &owner,
+        &String::from_str(&env, "Luna"),
+        &String::from_str(&env, "2021-03-20"),
+        &Gender::Female,
+        &Species::Cat,
+        &String::from_str(&env, "Siamese"),
+        &String::from_str(&env, "Cream"),
+        &4u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    let ok = client.add_weight_entry(&pet_id, &15u32);
+    assert!(ok);
+
+    let target_topic = Symbol::new(&env, "WeightRecorded");
+    let all = env.events().all();
+    let mut found = false;
+
+    for event in all.events() {
+        let ContractEventBody::V0(body) = &event.body;
+        let mut topics: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(&env);
+        for sv in body.topics.iter() {
+            topics.push_back(sv.clone().try_into_val(&env).unwrap());
+        }
+        if topics.len() >= 2 {
+            let t0: Val = topics.get(0).unwrap();
+            let t1: Val = topics.get(1).unwrap();
+            if let Ok(sym) = Symbol::try_from_val(&env, &t0) {
+                if sym == target_topic {
+                    if let Ok(pid) = u64::try_from_val(&env, &t1) {
+                        assert_eq!(pid, pet_id);
+                        let ev: WeightRecordedEvent = body.data.clone().try_into_val(&env).unwrap();
+                        assert_eq!(ev.pet_id, pet_id);
+                        assert_eq!(ev.weight, 15u32);
+                        assert_eq!(ev.recorded_by, owner);
+                        assert_eq!(ev.timestamp, env.ledger().timestamp());
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    assert!(found, "WeightRecorded event was not emitted");
 }
