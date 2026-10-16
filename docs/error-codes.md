@@ -262,6 +262,8 @@ the escrow module means something different from a `3` from `KoraContract`.
 | 32 | `AdopterApprovalRequired` | The adopter has not approved yet. |
 | 33 | `InputStringTooLong` | A string input exceeds its limit. |
 | 34 | `AdoptionNotExpired` | The adoption request has not expired yet. |
+| 35 | `TransferDisputed` | The transfer has an active dispute. |
+| 36 | `InvalidInput` | A function argument is invalid (e.g. pet_id is 0). |
 
 <!-- check-error-codes: enum=EscrowError file=stellar-contracts/contracts/pet-transfer-adoption/src/escrow.rs -->
 

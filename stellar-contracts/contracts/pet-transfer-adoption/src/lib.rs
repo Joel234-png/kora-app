@@ -75,6 +75,7 @@ pub struct PendingTransfer {
 /// `initiate_transfer`: 7 days. Distinct from [`TRANSFER_EXPIRY_SECONDS`],
 /// which backs the older owner-only [`PetOwnershipContract::reclaim_transfer`].
 pub const DEFAULT_TRANSFER_TIMEOUT_SECONDS: u64 = 7 * 24 * 60 * 60; // 604 800 s
+pub const MAX_TRANSFER_TIMEOUT_DAYS: u32 = 90;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -212,8 +213,8 @@ enum DataKey {
     AdoptionWaitingPeriod(u64), // pet_id -> waiting_period_days (per-pet override, optional)
     SpeciesAdoptionConfig(String), // species -> waiting_period_days
     JurisdictionAdoptionConfig(String), // jurisdiction -> AdoptionConfig
-    Admin,                        // adoption contract admin set on first set_adoption_config call
-    OwnerPetSet((Address, u64)),   // (owner, pet_id) -> bool for O(1) membership checks
+    Admin,                      // adoption contract admin set on first set_adoption_config call
+    OwnerPetSet((Address, u64)), // (owner, pet_id) -> bool for O(1) membership checks
 }
 
 /// ======================================================
@@ -275,6 +276,7 @@ pub enum ContractError {
     /// Returned when an attempt is made to expire or reclaim a transfer
     /// that has an active (unresolved) dispute. (Issue #62)
     TransferDisputed = 35,
+    InvalidInput = 36,
 }
 
 /// ======================================================
@@ -642,6 +644,10 @@ impl PetOwnershipContract {
         let pet = get_pet(&env, pet_id);
         pet.current_owner.require_auth();
 
+        if pet.current_owner == to {
+            panic_with_error!(&env, ContractError::InvalidRecipient);
+        }
+
         if env
             .storage()
             .persistent()
@@ -768,15 +774,16 @@ impl PetOwnershipContract {
     /// the original owner or any third party.
     ///
     /// # Errors
-    /// - [`ContractError::InvalidTimeoutDays`] — `transfer_timeout_days` must be ≥ 1;
-    ///   a zero value would cause the transfer to expire instantly upon creation.
+    /// - [`ContractError::InvalidTimeoutDays`] — `transfer_timeout_days` must be between 1 and
+    ///   [`MAX_TRANSFER_TIMEOUT_DAYS`]; a zero value would cause the transfer to expire instantly
+    ///   upon creation, and values > 90 could lock the transfer indefinitely.
     pub fn initiate_transfer_with_timeout(
         env: Env,
         pet_id: u64,
         to: Address,
         transfer_timeout_days: u32,
     ) {
-        if transfer_timeout_days == 0 {
+        if transfer_timeout_days == 0 || transfer_timeout_days > MAX_TRANSFER_TIMEOUT_DAYS {
             panic_with_error!(env, ContractError::InvalidTimeoutDays);
         }
 
@@ -847,10 +854,8 @@ impl PetOwnershipContract {
             .persistent()
             .remove(&DataKey::PendingTransfer(pet_id));
 
-        env.events().publish(
-            (EVT_TRANSFER_EXPIRED, pet_id),
-            (transfer.from, transfer.to),
-        );
+        env.events()
+            .publish((EVT_TRANSFER_EXPIRED, pet_id), (transfer.from, transfer.to));
     }
 
     /// Reject a pending adoption. Any participant may cancel the adoption.
@@ -1097,6 +1102,10 @@ impl PetOwnershipContract {
     /// ----------------------------------
 
     pub fn create_pet(env: Env, pet_id: u64, owner: Address) {
+        if pet_id == 0 {
+            panic_with_error!(env, ContractError::InvalidInput);
+        }
+
         owner.require_auth();
 
         let pet = Pet {
@@ -1164,14 +1173,20 @@ impl PetOwnershipContract {
     /// ----------------------------------
     ///
     /// Completes the ownership transfer after the 48-hour dispute window has
-    /// elapsed. Either party may call this. Panics if the window has not yet
-    /// elapsed or if the transfer has been disputed.
-    pub fn finalize_transfer(env: Env, pet_id: u64) {
+    /// elapsed. Either party (`from` or `to`) may call this, and must authenticate.
+    /// Panics with [`ContractError::Unauthorized`] if called by a third party.
+    /// Panics if the window has not yet elapsed or if the transfer has been disputed.
+    pub fn finalize_transfer(env: Env, pet_id: u64, caller: Address) {
         let escrowed: EscrowedTransfer = env
             .storage()
             .persistent()
             .get(&DataKey::EscrowedTransfer(pet_id))
             .unwrap_or_else(|| panic_with_error!(env, ContractError::NoEscrowedTransfer));
+
+        caller.require_auth();
+        if caller != escrowed.from && caller != escrowed.to {
+            panic_with_error!(env, ContractError::Unauthorized);
+        }
 
         if escrowed.disputed {
             panic_with_error!(env, ContractError::TransferAlreadyDisputed);
@@ -1368,7 +1383,10 @@ impl PetOwnershipContract {
             .storage()
             .persistent()
             .get(&DataKey::AdoptionConfig)
-            .unwrap_or(AdoptionConfig { waiting_period_days: 0, expiry_seconds: ADOPTION_EXPIRY_SECONDS });
+            .unwrap_or(AdoptionConfig {
+                waiting_period_days: 0,
+                expiry_seconds: ADOPTION_EXPIRY_SECONDS,
+            });
 
         let expiry_seconds = if config.expiry_seconds == 0 {
             ADOPTION_EXPIRY_SECONDS
@@ -1385,10 +1403,8 @@ impl PetOwnershipContract {
             .persistent()
             .remove(&DataKey::PendingAdoption(pet_id));
 
-        env.events().publish(
-            (EVT_ADOPTION_EXPIRED, pet_id),
-            (adoption.from, adoption.to),
-        );
+        env.events()
+            .publish((EVT_ADOPTION_EXPIRED, pet_id), (adoption.from, adoption.to));
     }
 
     /// ----------------------------------
