@@ -3,8 +3,10 @@ const fs = require("fs");
 const path = require("path");
 
 async function main() {
-  const Factory = await hre.ethers.getContractFactory("KoraRegistry");
-  const registry = await Factory.deploy();
+  const [deployer] = await hre.ethers.getSigners();
+
+  const KoraRegistry = await hre.ethers.getContractFactory("KoraRegistry");
+  const registry = await KoraRegistry.deploy();
   await registry.waitForDeployment();
 
   const address = await registry.getAddress();
@@ -29,7 +31,9 @@ async function main() {
   return address;
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+main()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
