@@ -1072,6 +1072,150 @@ describe("KoraRegistry", function () {
   });
 
   // ---------------------------------------------------------------------------
-  // Issue #920 — correctMedicalRecord
+  // Issues #223, #224, #225 — Pagination limits
   // ---------------------------------------------------------------------------
+  describe("MAX_PAGE_SIZE constant", function () {
+    it("exposes MAX_PAGE_SIZE constant set to 50", async function () {
+      expect(await registry.MAX_PAGE_SIZE()).to.equal(50);
+    });
+  });
+
+  describe("Issue #223 — Enforce upper bound on limit in getPetRecordsPaged", function () {
+    let petId;
+
+    beforeEach(async function () {
+      petId = await registerPet();
+      for (let i = 0; i < 60; i++) {
+        await registry.connect(vet).addMedicalRecord(
+          petId, 0, `Diag${i}`, `Treat${i}`, ""
+        );
+      }
+    });
+
+    it("clamps limit to MAX_PAGE_SIZE when limit > MAX_PAGE_SIZE (e.g. limit = 1000)", async function () {
+      const page = await registry.getPetRecordsPaged(petId, 0, 1000);
+      expect(page.length).to.equal(50);
+      expect(page[0].diagnosis).to.equal("Diag0");
+      expect(page[49].diagnosis).to.equal("Diag49");
+    });
+
+    it("returns the requested slice for valid page requests within bounds (1..50)", async function () {
+      const page = await registry.getPetRecordsPaged(petId, 10, 25);
+      expect(page.length).to.equal(25);
+      expect(page[0].diagnosis).to.equal("Diag10");
+      expect(page[24].diagnosis).to.equal("Diag34");
+    });
+
+    it("paginates correctly across page boundaries with clamped or normal limit", async function () {
+      const page1 = await registry.getPetRecordsPaged(petId, 0, 50);
+      expect(page1.length).to.equal(50);
+
+      const page2 = await registry.getPetRecordsPaged(petId, 50, 1000);
+      expect(page2.length).to.equal(10);
+      expect(page2[0].diagnosis).to.equal("Diag50");
+      expect(page2[9].diagnosis).to.equal("Diag59");
+    });
+
+    it("returns empty array when offset >= total", async function () {
+      const page = await registry.getPetRecordsPaged(petId, 60, 1000);
+      expect(page.length).to.equal(0);
+    });
+
+    it("returns empty array when limit == 0", async function () {
+      const page = await registry.getPetRecordsPaged(petId, 0, 0);
+      expect(page.length).to.equal(0);
+    });
+  });
+
+  describe("Issue #224 — Enforce upper bound on limit in getPetsByOwnerPaged", function () {
+    beforeEach(async function () {
+      for (let i = 0; i < 60; i++) {
+        await registry.connect(owner).registerPet(
+          `Pet${i}`, "Dog", "Mix", "2021-01-01"
+        );
+      }
+    });
+
+    it("enforces maximum page cap of 50 items when limit exceeds MAX_PAGE_SIZE", async function () {
+      const page = await registry.getPetsByOwnerPaged(owner.address, 0, 100);
+      expect(page.length).to.equal(50);
+    });
+
+    it("returns the requested slice for requests within bounds (e.g. limit = 20)", async function () {
+      const page = await registry.getPetsByOwnerPaged(owner.address, 10, 20);
+      expect(page.length).to.equal(20);
+    });
+
+    it("functions correctly across page boundaries", async function () {
+      const page1 = await registry.getPetsByOwnerPaged(owner.address, 0, 50);
+      expect(page1.length).to.equal(50);
+
+      const page2 = await registry.getPetsByOwnerPaged(owner.address, 50, 50);
+      expect(page2.length).to.equal(10);
+    });
+
+    it("returns empty array for out-of-bounds offset", async function () {
+      const page = await registry.getPetsByOwnerPaged(owner.address, 60, 50);
+      expect(page.length).to.equal(0);
+    });
+
+    it("returns empty array when limit == 0", async function () {
+      const page = await registry.getPetsByOwnerPaged(owner.address, 0, 0);
+      expect(page.length).to.equal(0);
+    });
+  });
+
+  describe("Issue #225 — Enforce upper bound on limit in getVets directory query", function () {
+    let freshRegistry;
+
+    beforeEach(async function () {
+      const Factory = await ethers.getContractFactory("KoraRegistry");
+      freshRegistry = await Factory.deploy();
+
+      // Register 60 vets
+      for (let i = 0; i < 60; i++) {
+        const wallet = ethers.Wallet.createRandom().connect(ethers.provider);
+        await network.provider.send("hardhat_setBalance", [
+          wallet.address,
+          "0x1000000000000000000",
+        ]);
+        await freshRegistry.connect(wallet).registerVet(`LIC-${i}`, `Spec-${i}`);
+      }
+    });
+
+    it("registers 60 vets and querying with limit = 100 returns only 50", async function () {
+      const page = await freshRegistry.getVets(0, 100);
+      expect(page.length).to.equal(50);
+    });
+
+    it("directory pagination correctly iterates over registered veterinarians", async function () {
+      const page1 = await freshRegistry.getVets(0, 50);
+      expect(page1.length).to.equal(50);
+      expect(page1[0].licenseNumber).to.equal("LIC-0");
+      expect(page1[49].licenseNumber).to.equal("LIC-49");
+
+      const page2 = await freshRegistry.getVets(50, 50);
+      expect(page2.length).to.equal(10);
+      expect(page2[0].licenseNumber).to.equal("LIC-50");
+      expect(page2[9].licenseNumber).to.equal("LIC-59");
+    });
+
+    it("returns requested slice within bounds (1..50)", async function () {
+      const page = await freshRegistry.getVets(10, 15);
+      expect(page.length).to.equal(15);
+      expect(page[0].licenseNumber).to.equal("LIC-10");
+      expect(page[14].licenseNumber).to.equal("LIC-24");
+    });
+
+    it("returns empty array when offset exceeds total vets", async function () {
+      const page = await freshRegistry.getVets(60, 10);
+      expect(page.length).to.equal(0);
+    });
+
+    it("returns empty array when limit == 0", async function () {
+      const page = await freshRegistry.getVets(0, 0);
+      expect(page.length).to.equal(0);
+    });
+  });
 });
+

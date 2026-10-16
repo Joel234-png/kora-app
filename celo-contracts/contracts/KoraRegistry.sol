@@ -20,6 +20,9 @@ contract KoraRegistry is Pausable {
     /// @notice Maximum number of records scanned/returned in date-range query when limit is omitted.
     uint256 public constant MAX_QUERY_LIMIT = 100;
 
+    /// @notice Maximum page size returned by paginated query functions (issues #223, #224, #225).
+    uint256 public constant MAX_PAGE_SIZE = 50;
+
     // -------------------------------------------------------------------------
     // State
     // -------------------------------------------------------------------------
@@ -645,6 +648,9 @@ contract KoraRegistry is Pausable {
         if (offset >= total || limit == 0) {
             return new uint256[](0);
         }
+        if (limit > MAX_PAGE_SIZE) {
+            limit = MAX_PAGE_SIZE;
+        }
         uint256 end = offset + limit;
         if (end > total) end = total;
         uint256 size = end - offset;
@@ -669,6 +675,9 @@ contract KoraRegistry is Pausable {
         if (offset >= total || limit == 0) {
             return new MedicalRecord[](0);
         }
+        if (limit > MAX_PAGE_SIZE) {
+            limit = MAX_PAGE_SIZE;
+        }
         uint256 end = offset + limit;
         if (end > total) end = total;
         uint256 size = end - offset;
@@ -690,6 +699,9 @@ contract KoraRegistry is Pausable {
         uint256 total = _vetAddresses.length;
         if (offset >= total || limit == 0) {
             return new Vet[](0);
+        }
+        if (limit > MAX_PAGE_SIZE) {
+            limit = MAX_PAGE_SIZE;
         }
         uint256 end = offset + limit;
         if (end > total) end = total;
