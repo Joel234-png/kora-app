@@ -213,6 +213,12 @@ mod test_emergency_notify_rate_limit;
 mod test_issues_100_101_102_103;
 #[cfg(test)]
 mod test_ownership_history_privacy;
+#[cfg(test)]
+mod test_recovery_tag_transfer;
+#[cfg(test)]
+mod test_remove_attachment;
+#[cfg(test)]
+mod test_grooming_slot_booking;
 
 #[cfg(test)]
 mod test_access_control;
@@ -332,6 +338,16 @@ const MAX_BATCH_ERROR_MESSAGES: usize = 128;
 /// adversarial or buggy client flood one record and silently exhaust the pet
 /// owner's storage quota. `add_attachment` enforces this cap. (Issue #774 / Wave 9 #99)
 const MAX_ATTACHMENTS_PER_RECORD: u32 = 10;
+
+/// Minimum bookable grooming-slot duration, in minutes. Sub-slot bookings
+/// would only produce noise on a groomer's calendar, so `book_grooming_slot`
+/// rejects anything shorter. (Issue #217)
+const MIN_GROOMING_SLOT_MINS: u64 = 15;
+
+/// Maximum bookable grooming-slot duration, in minutes (8 hours). A single
+/// unbounded reservation could otherwise block a groomer's calendar for
+/// weeks. `book_grooming_slot` rejects anything longer. (Issue #217)
+const MAX_GROOMING_SLOT_MINS: u64 = 480;
 
 /// Maximum plausible weight for a pet, in grams (500 kg). Rejects both
 /// zero-weight entries and unrealistic values that would corrupt dosage
@@ -6603,6 +6619,11 @@ impl KoraContract {
 
             Self::store_pet(&env, id, &pet);
 
+            // Keep any linked recovery tag pointing at the current legal
+            // owner, so `get_tag` never reports a former owner once the
+            // transfer is accepted. (Issue #214)
+            KoraContract::update_linked_tag_owner(&env, id, &pet.owner);
+
             KoraContract::log_ownership_change(
                 &env,
                 id,
@@ -9156,6 +9177,32 @@ impl KoraContract {
         tag_id
     }
 
+    /// Sync the linked recovery tag's owner with the pet's current owner.
+    ///
+    /// `PetTag.owner` is snapshotted at link time, so it must be refreshed
+    /// whenever ownership legally changes — otherwise `get_tag` keeps
+    /// reporting a former owner for a lost pet. No-op when the pet has no
+    /// linked tag. (Issue #214)
+    fn update_linked_tag_owner(env: &Env, pet_id: u64, new_owner: &Address) {
+        if let Some(tag_id) = env
+            .storage()
+            .instance()
+            .get::<TagKey, BytesN<32>>(&TagKey::PetTagId(pet_id))
+        {
+            if let Some(mut tag) = env
+                .storage()
+                .instance()
+                .get::<TagKey, PetTag>(&TagKey::Tag(tag_id))
+            {
+                tag.owner = new_owner.clone();
+                tag.updated_at = env.ledger().timestamp();
+                env.storage()
+                    .instance()
+                    .set(&TagKey::Tag(tag.tag_id.clone()), &tag);
+            }
+        }
+    }
+
     pub fn get_pet_by_tag(env: Env, tag_id: BytesN<32>) -> Option<PetProfile> {
         if let Some(tag) = env
             .storage()
@@ -9894,6 +9941,78 @@ impl KoraContract {
             Some(record) => record.attachment_hashes.len(),
             None => 0,
         }
+    }
+
+    /// Remove an attachment from a medical record by its IPFS hash.
+    ///
+    /// Only the authoring vet or the pet's current owner may remove an
+    /// attachment (Issue #215). A successful removal deletes the matching
+    /// entry from the record's attachment list and releases one unit of the
+    /// pet's storage quota consumed by `add_attachment` (Wave 9 #102), so an
+    /// erroneously uploaded file no longer permanently consumes quota.
+    ///
+    /// Panics with [`ContractError::RecordNotFound`] if the record does not
+    /// exist, [`ContractError::Unauthorized`] if the caller is neither the
+    /// authoring vet nor the pet owner, and [`ContractError::InvalidInput`]
+    /// if no attachment matches `ipfs_hash`.
+    pub fn remove_attachment(
+        env: Env,
+        record_id: u64,
+        ipfs_hash: String,
+        caller: Address,
+    ) -> bool {
+        caller.require_auth();
+
+        let mut record: MedicalRecord = env
+            .storage()
+            .instance()
+            .get(&MedicalKey::MedicalRecord(record_id))
+            .unwrap_or_else(|| env.panic_with_error(ContractError::RecordNotFound));
+
+        let pet: Pet = env
+            .storage()
+            .instance()
+            .get(&DataKey::Pet(record.pet_id))
+            .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
+
+        if caller != record.vet_address && caller != pet.owner {
+            panic_with_error!(&env, ContractError::Unauthorized);
+        }
+
+        // Soroban `Vec` has no in-place removal, so rebuild the list without
+        // the matching entry.
+        let mut remaining: Vec<Attachment> = Vec::new(&env);
+        let mut found = false;
+        for attachment in record.attachment_hashes.iter() {
+            if attachment.ipfs_hash == ipfs_hash {
+                found = true;
+            } else {
+                remaining.push_back(attachment);
+            }
+        }
+        if !found {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
+        record.attachment_hashes = remaining;
+        record.updated_at = env.ledger().timestamp();
+
+        env.storage()
+            .instance()
+            .set(&MedicalKey::MedicalRecord(record_id), &record);
+
+        // Release the quota unit consumed when the attachment was added.
+        Self::decrement_pet_storage(&env, record.pet_id);
+
+        Self::log_access(
+            &env,
+            record.pet_id,
+            caller,
+            AccessAction::Write,
+            String::from_str(&env, "Attachment removed from medical record"),
+        );
+
+        true
     }
 
     fn log_ownership_change(
@@ -11751,6 +11870,16 @@ impl KoraContract {
     ) -> u64 {
         owner.require_auth();
 
+        // (Issue #217) Only future start times with sane durations may be
+        // booked: reject past/now bookings and zero-minute or multi-week
+        // holds that would block the groomer's calendar.
+        if start_time <= env.ledger().timestamp() {
+            panic_with_error!(env, ContractError::InvalidInput);
+        }
+        if duration_mins < MIN_GROOMING_SLOT_MINS || duration_mins > MAX_GROOMING_SLOT_MINS {
+            panic_with_error!(env, ContractError::InvalidInput);
+        }
+
         // Check the pet exists and caller is the owner
         let pet: Pet = env
             .storage()
@@ -11800,6 +11929,12 @@ impl KoraContract {
             .get(&GroomingKey::GroomingRecordCount)
             .unwrap_or(0u64)
             .saturating_add(1);
+        // Persist the incremented counter so subsequent bookings receive
+        // monotonically increasing unique IDs instead of always 1.
+        // (Issue #216)
+        env.storage()
+            .instance()
+            .set(&GroomingKey::GroomingRecordCount, &slot_id);
 
         let new_slot = GroomingSlot {
             slot_id,
