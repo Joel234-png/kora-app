@@ -127,6 +127,7 @@ pub enum AdoptionState {
     Completed,
     Waived,
     Rejected,
+    Expired,
 }
 
 /// A record tracking the full lifecycle of an adoption.
@@ -275,6 +276,8 @@ pub enum ContractError {
     /// Returned when an attempt is made to expire or reclaim a transfer
     /// that has an active (unresolved) dispute. (Issue #62)
     TransferDisputed = 35,
+    /// Returned when a dispute is raised after the dispute window has elapsed.
+    DisputeWindowElapsed = 36,
 }
 
 /// ======================================================
@@ -791,6 +794,10 @@ impl PetOwnershipContract {
             panic_with_error!(env, ContractError::TransferAlreadyPending);
         }
 
+        if pet.current_owner == to {
+            panic_with_error!(env, ContractError::InvalidRecipient);
+        }
+
         let timeout_secs = (transfer_timeout_days as u64).saturating_mul(86400);
 
         let transfer = PendingTransfer {
@@ -1251,7 +1258,7 @@ impl PetOwnershipContract {
 
         let now = env.ledger().timestamp();
         if now.saturating_sub(escrowed.escrowed_at) >= DISPUTE_WINDOW_SECONDS {
-            panic_with_error!(env, ContractError::DisputeWindowNotElapsed);
+            panic_with_error!(env, ContractError::DisputeWindowElapsed);
         }
 
         // Require auth from the caller and verify they are a party to the transfer.
@@ -1385,6 +1392,17 @@ impl PetOwnershipContract {
             .persistent()
             .remove(&DataKey::PendingAdoption(pet_id));
 
+        // Update the adoption record to reflect expired state
+        let mut record: AdoptionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AdoptionRecord(pet_id))
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::NoPendingAdoption));
+        record.state = AdoptionState::Expired;
+        env.storage()
+            .persistent()
+            .set(&DataKey::AdoptionRecord(pet_id), &record);
+
         env.events().publish(
             (EVT_ADOPTION_EXPIRED, pet_id),
             (adoption.from, adoption.to),
@@ -1406,13 +1424,24 @@ impl PetOwnershipContract {
     /// - [`ContractError::BatchOwnerMismatch`] – not all pets share the same owner.
     /// - [`ContractError::TransferAlreadyPending`] – any pet already has a pending transfer.
     pub fn batch_initiate_transfer(env: Env, pet_ids: Vec<u64>, to: Address) {
+        const MAX_BATCH_SIZE: u32 = 20;
+
         if pet_ids.is_empty() {
             panic_with_error!(env, ContractError::EmptyBatch);
+        }
+        if pet_ids.len() > MAX_BATCH_SIZE {
+            panic_with_error!(env, ContractError::BatchTooLarge);
         }
 
         // Phase 1: read-only validation — discover owner, ensure all pets are eligible.
         let mut expected_owner: Option<Address> = None;
+        let mut seen_ids = Vec::new(&env);
         for pet_id in pet_ids.iter() {
+            if seen_ids.contains(&pet_id) {
+                panic_with_error!(env, ContractError::InvalidBatch);
+            }
+            seen_ids.push_back(pet_id);
+
             let pet = get_pet(&env, pet_id);
 
             match expected_owner {
