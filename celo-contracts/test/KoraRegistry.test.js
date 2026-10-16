@@ -1074,4 +1074,207 @@ describe("KoraRegistry", function () {
   // ---------------------------------------------------------------------------
   // Issue #920 — correctMedicalRecord
   // ---------------------------------------------------------------------------
+
+  // ---------------------------------------------------------------------------
+  // Issue #229 — Explicit pet existence check in deactivatePet and reactivatePet
+  // ---------------------------------------------------------------------------
+  describe("#229 — deactivatePet/reactivatePet explicit existence check", function () {
+    it("deactivatePet reverts with 'KoraRegistry: pet does not exist' for petId == 0", async function () {
+      await expect(registry.connect(owner).deactivatePet(0))
+        .to.be.revertedWith("KoraRegistry: pet does not exist");
+    });
+
+    it("deactivatePet reverts with 'KoraRegistry: pet does not exist' for a never-registered petId", async function () {
+      await expect(registry.connect(owner).deactivatePet(9999))
+        .to.be.revertedWith("KoraRegistry: pet does not exist");
+    });
+
+    it("reactivatePet reverts with 'KoraRegistry: pet does not exist' for petId == 0", async function () {
+      await expect(registry.connect(owner).reactivatePet(0))
+        .to.be.revertedWith("KoraRegistry: pet does not exist");
+    });
+
+    it("reactivatePet reverts with 'KoraRegistry: pet does not exist' for a never-registered petId", async function () {
+      await expect(registry.connect(owner).reactivatePet(9999))
+        .to.be.revertedWith("KoraRegistry: pet does not exist");
+    });
+
+    it("deactivatePet succeeds for a valid registered pet and emits PetDeactivated", async function () {
+      const petId = await registerPet();
+      await expect(registry.connect(owner).deactivatePet(petId))
+        .to.emit(registry, "PetDeactivated")
+        .withArgs(petId);
+      expect((await registry.pets(petId)).active).to.equal(false);
+    });
+
+    it("reactivatePet succeeds for a deactivated valid pet and emits PetReactivated", async function () {
+      const petId = await registerPet();
+      await registry.connect(owner).deactivatePet(petId);
+      await expect(registry.connect(owner).reactivatePet(petId))
+        .to.emit(registry, "PetReactivated")
+        .withArgs(petId);
+      expect((await registry.pets(petId)).active).to.equal(true);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Issue #228 — Non-empty and max-length validation for updateSpecialization
+  // ---------------------------------------------------------------------------
+  describe("#228 — updateSpecialization string length validation", function () {
+    it("reverts with 'KoraRegistry: invalid specialization length' for an empty string", async function () {
+      await expect(registry.connect(vet).updateSpecialization(""))
+        .to.be.revertedWith("KoraRegistry: invalid specialization length");
+    });
+
+    it("reverts with 'KoraRegistry: invalid specialization length' for a string exceeding 128 bytes", async function () {
+      await expect(registry.connect(vet).updateSpecialization("A".repeat(129)))
+        .to.be.revertedWith("KoraRegistry: invalid specialization length");
+    });
+
+    it("accepts a specialization of exactly 128 bytes", async function () {
+      const spec128 = "S".repeat(128);
+      await expect(registry.connect(vet).updateSpecialization(spec128))
+        .to.emit(registry, "VetSpecializationUpdated")
+        .withArgs(vet.address, spec128);
+      expect((await registry.vets(vet.address)).specialization).to.equal(spec128);
+    });
+
+    it("accepts a valid non-empty specialization and emits VetSpecializationUpdated", async function () {
+      await expect(registry.connect(vet).updateSpecialization("Cardiology"))
+        .to.emit(registry, "VetSpecializationUpdated")
+        .withArgs(vet.address, "Cardiology");
+      expect((await registry.vets(vet.address)).specialization).to.equal("Cardiology");
+    });
+
+    it("reverts for an unregistered address", async function () {
+      await expect(registry.connect(other).updateSpecialization("Cardiology"))
+        .to.be.revertedWith("KoraRegistry: not a registered vet");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Issue #226 — Validate startDate <= endDate and pet existence in getPetRecordsByDateRange
+  // ---------------------------------------------------------------------------
+  describe("#226 — getPetRecordsByDateRange validation", function () {
+    let petId, t0, t1, t2;
+
+    beforeEach(async function () {
+      petId = await registerPet();
+      const base = (await ethers.provider.getBlock("latest")).timestamp;
+      t0 = base + 1000;
+      t1 = base + 2000;
+      t2 = base + 3000;
+      for (const ts of [t0, t1, t2]) {
+        await network.provider.send("evm_setNextBlockTimestamp", [ts]);
+        await registry.connect(vet).addMedicalRecord(petId, 0, "diag", "treat", "");
+      }
+    });
+
+    it("reverts with 'KoraRegistry: invalid date range' when startDate > endDate", async function () {
+      await expect(registry.getPetRecordsByDateRange(petId, t2, t0))
+        .to.be.revertedWith("KoraRegistry: invalid date range");
+    });
+
+    it("reverts with 'KoraRegistry: invalid date range' for inverted date range via 4-arg overload", async function () {
+      await expect(
+        registry["getPetRecordsByDateRange(uint256,uint256,uint256,uint256)"](petId, t2, t0, 10)
+      ).to.be.revertedWith("KoraRegistry: invalid date range");
+    });
+
+    it("reverts with 'KoraRegistry: pet does not exist' for a non-existent petId", async function () {
+      await expect(registry.getPetRecordsByDateRange(99999, t0, t2))
+        .to.be.revertedWith("KoraRegistry: pet does not exist");
+    });
+
+    it("accepts equal startDate and endDate (single-timestamp boundary)", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t1, t1);
+      expect(ids.length).to.equal(1);
+    });
+
+    it("returns all matching records for a valid range", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t0, t2);
+      expect(ids.length).to.equal(3);
+    });
+
+    it("returns an empty array for a valid range with no records", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t2 + 1000, t2 + 2000);
+      expect(ids.length).to.equal(0);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Issue #227 — Paginated getPetRecordsByTypePaged with existence check
+  // ---------------------------------------------------------------------------
+  describe("#227 — getPetRecordsByTypePaged", function () {
+    const Vaccination = 1;
+    const Surgery = 2;
+    const LabResult = 3;
+    let petId;
+
+    beforeEach(async function () {
+      petId = await registerPet();
+      // Add 4 Vaccination records and 2 Surgery records
+      for (let i = 0; i < 4; i++) {
+        await registry.connect(vet).addMedicalRecord(petId, Vaccination, `rabies-${i}`, "shot", "");
+      }
+      for (let i = 0; i < 2; i++) {
+        await registry.connect(vet).addMedicalRecord(petId, Surgery, `surgery-${i}`, "procedure", "");
+      }
+    });
+
+    it("reverts with 'KoraRegistry: pet does not exist' for a non-existent petId", async function () {
+      await expect(registry.getPetRecordsByTypePaged(99999, Vaccination, 0, 10))
+        .to.be.revertedWith("KoraRegistry: pet does not exist");
+    });
+
+    it("returns an empty array when limit == 0", async function () {
+      const page = await registry.getPetRecordsByTypePaged(petId, Vaccination, 0, 0);
+      expect(page.length).to.equal(0);
+    });
+
+    it("returns all matched records when total fits within limit", async function () {
+      const page = await registry.getPetRecordsByTypePaged(petId, Vaccination, 0, 10);
+      expect(page.length).to.equal(4);
+      expect(page.every(r => Number(r.recordType) === Vaccination)).to.equal(true);
+    });
+
+    it("returns the correct first page", async function () {
+      const page = await registry.getPetRecordsByTypePaged(petId, Vaccination, 0, 2);
+      expect(page.length).to.equal(2);
+    });
+
+    it("returns the correct second page", async function () {
+      const page = await registry.getPetRecordsByTypePaged(petId, Vaccination, 2, 2);
+      expect(page.length).to.equal(2);
+    });
+
+    it("returns a partial last page when offset + limit exceeds total matches", async function () {
+      const page = await registry.getPetRecordsByTypePaged(petId, Vaccination, 3, 10);
+      expect(page.length).to.equal(1);
+    });
+
+    it("returns an empty array when offset >= total matching records", async function () {
+      const page = await registry.getPetRecordsByTypePaged(petId, Vaccination, 10, 5);
+      expect(page.length).to.equal(0);
+    });
+
+    it("clamps limit to MAX_PAGE_SIZE (50)", async function () {
+      const maxPageSize = await registry.MAX_PAGE_SIZE();
+      expect(Number(maxPageSize)).to.equal(50);
+      // Even requesting 200 should only return at most MAX_PAGE_SIZE entries
+      const page = await registry.getPetRecordsByTypePaged(petId, Vaccination, 0, 200);
+      expect(page.length).to.be.at.most(50);
+    });
+
+    it("returns an empty array when no records match the type", async function () {
+      const page = await registry.getPetRecordsByTypePaged(petId, LabResult, 0, 10);
+      expect(page.length).to.equal(0);
+    });
+
+    it("filters correctly by Surgery type", async function () {
+      const page = await registry.getPetRecordsByTypePaged(petId, Surgery, 0, 10);
+      expect(page.length).to.equal(2);
+      expect(page.every(r => Number(r.recordType) === Surgery)).to.equal(true);
+    });
+  });
 });
