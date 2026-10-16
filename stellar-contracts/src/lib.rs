@@ -323,6 +323,7 @@ const MAX_SEARCH_TOKENS_PER_RECORD: u32 = 16;
 #[allow(dead_code)]
 const MAX_SEARCH_NOTES_LEN: u32 = 512;
 const MAX_LINEAGE_DEPTH: u32 = 16;
+pub const MAX_ALLOWED_LINEAGE_DEPTH: u32 = 8;
 const MAX_LOG_ENTRIES: u32 = 1_000;
 const MAX_ACTIVE_SUBSCRIPTIONS_PER_ADDRESS: u32 = 10;
 const MAX_BATCH_ERROR_MESSAGES: usize = 128;
@@ -4362,7 +4363,7 @@ impl KoraContract {
         }
 
         invoker.require_auth();
-        if !admins.contains(invoker) {
+        if !admins.contains(invoker.clone()) {
             panic_with_error!(&env, ContractError::InvokerNotInAdminList);
         }
 
@@ -4370,12 +4371,11 @@ impl KoraContract {
             env.storage()
                 .instance()
                 .set(&DataKey::Admin, &invoker);
-        } else {
-            env.storage().instance().set(&SystemKey::Admins, &admins);
-            env.storage()
-                .instance()
-                .set(&SystemKey::AdminThreshold, &threshold);
         }
+        env.storage().instance().set(&SystemKey::Admins, &admins);
+        env.storage()
+            .instance()
+            .set(&SystemKey::AdminThreshold, &threshold);
         env.storage().instance().set(
             &DataKey::ContractVersion,
             &ContractVersion {
@@ -12762,12 +12762,41 @@ impl KoraContract {
             .set(&BreedingKey::PetBreedingCount(pet_id), &(count + 1));
     }
 
-    pub fn add_offspring(env: Env, record_id: u64, offspring_id: u64) -> bool {
+    pub fn add_offspring(env: Env, record_id: u64, offspring_id: u64, caller: Address) -> bool {
+        caller.require_auth();
+
         let mut record: BreedingRecord = env
             .storage()
             .persistent()
             .get(&BreedingKey::BreedingRecord(record_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::PetNotFound));
+
+        let offspring: Pet = env
+            .storage()
+            .instance()
+            .get(&DataKey::Pet(offspring_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::PetNotFound));
+
+        let sire_owner = env
+            .storage()
+            .instance()
+            .get::<DataKey, Pet>(&DataKey::Pet(record.sire_id))
+            .map(|p| p.owner);
+        let dam_owner = env
+            .storage()
+            .instance()
+            .get::<DataKey, Pet>(&DataKey::Pet(record.dam_id))
+            .map(|p| p.owner);
+
+        let is_authorized = caller == offspring.owner
+            || sire_owner.as_ref() == Some(&caller)
+            || dam_owner.as_ref() == Some(&caller)
+            || record.breeder == caller
+            || Self::is_admin_address(&env, &caller);
+
+        if !is_authorized {
+            panic_with_error!(&env, ContractError::Unauthorized);
+        }
 
         // Self-lineage check
         if offspring_id == record.sire_id || offspring_id == record.dam_id {
@@ -12835,6 +12864,9 @@ impl KoraContract {
     }
 
     pub fn get_lineage(env: Env, pet_id: u64, max_depth: u32) -> Vec<u64> {
+        if max_depth > MAX_ALLOWED_LINEAGE_DEPTH {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
         Self::collect_lineage_vec(&env, pet_id, max_depth)
     }
 
@@ -13813,8 +13845,10 @@ impl KoraContract {
     }
 
     pub fn amend_medical_record(env: Env, pet_id: u64, record_id: u64, caller: Address, input: MedicalRecordAmendmentInput) -> u32 {
-        let _ = pet_id;
         let record: MedicalRecord = Self::load_medical_record(&env, record_id).unwrap_or_else(|| panic_with_error!(&env, ContractError::RecordNotFound));
+        if record.pet_id != pet_id {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
         record.vet_address.require_auth();
         let version: u32 = env.storage().instance().get::<MedicalKey, u32>(&MedicalKey::MedicalRecordAmendmentCount(record_id)).unwrap_or(0);
         if version >= 5 { panic_with_error!(&env, ContractError::TooManyItems); }
@@ -13845,7 +13879,10 @@ impl KoraContract {
     }
 
     pub fn diff_record_versions(env: Env, pet_id: u64, record_id: u64, from_version: u32, to_version: u32) -> Vec<MedicalFieldDiff> {
-        let _ = pet_id;
+        let record: MedicalRecord = Self::load_medical_record(&env, record_id).unwrap_or_else(|| panic_with_error!(&env, ContractError::RecordNotFound));
+        if record.pet_id != pet_id {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
         let max_version: u32 = env.storage().instance().get::<MedicalKey, u32>(&MedicalKey::MedicalRecordAmendmentCount(record_id)).unwrap_or(0);
         // to_version must be a valid stored version (1..=max_version)
         if to_version == 0 || to_version > max_version {
