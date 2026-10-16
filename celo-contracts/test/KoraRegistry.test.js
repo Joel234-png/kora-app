@@ -1074,4 +1074,84 @@ describe("KoraRegistry", function () {
   // ---------------------------------------------------------------------------
   // Issue #920 — correctMedicalRecord
   // ---------------------------------------------------------------------------
+
+  // ---------------------------------------------------------------------------
+  // Issue #233 — getPetRecordsByDateRange edge cases
+  // ---------------------------------------------------------------------------
+  describe("getPetRecordsByDateRange edge cases", function () {
+    let petId, t0, t1, t2;
+
+    beforeEach(async function () {
+      petId = await registerPet();
+      const base = (await ethers.provider.getBlock("latest")).timestamp;
+      t0 = base + 1000;
+      t1 = base + 2000;
+      t2 = base + 3000;
+      for (const ts of [t0, t1, t2]) {
+        await network.provider.send("evm_setNextBlockTimestamp", [ts]);
+        await registry.connect(vet).addMedicalRecord(petId, 0, "diag", "treat", "");
+      }
+    });
+
+    it("includes a record whose timestamp equals the exact startDate boundary", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t0, t0);
+      expect(ids.length).to.equal(1);
+    });
+
+    it("includes a record whose timestamp equals the exact endDate boundary", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t2, t2);
+      expect(ids.length).to.equal(1);
+    });
+
+    it("includes records where startDate == endDate == middle timestamp (single-point range)", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t1, t1);
+      expect(ids.length).to.equal(1);
+    });
+
+    it("returns empty array when range falls strictly between two records", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t0 + 1, t1 - 1);
+      expect(ids.length).to.equal(0);
+    });
+
+    it("returns empty array when range is entirely before all records", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, 0, t0 - 1);
+      expect(ids.length).to.equal(0);
+    });
+
+    it("returns empty array when range is entirely after all records", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t2 + 1, t2 + 9999);
+      expect(ids.length).to.equal(0);
+    });
+
+    it("returns all three records when range spans [startDate=t0, endDate=t2]", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t0, t2);
+      expect(ids.length).to.equal(3);
+    });
+
+    it("returns only the two records inside a partial range [t0, t1]", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t0, t1);
+      expect(ids.length).to.equal(2);
+    });
+
+    it("returns correct filtering when multiple records share the same timestamp", async function () {
+      // Mine two more records at timestamps that are very close together but adjacent
+      const dupTs1 = t2 + 10;
+      const dupTs2 = t2 + 11;
+      await network.provider.send("evm_setNextBlockTimestamp", [dupTs1]);
+      await registry.connect(vet).addMedicalRecord(petId, 0, "dup1", "treat", "");
+      await network.provider.send("evm_setNextBlockTimestamp", [dupTs2]);
+      await registry.connect(vet).addMedicalRecord(petId, 0, "dup2", "treat", "");
+
+      // Range exactly covering both duplicate records
+      const ids = await registry.getPetRecordsByDateRange(petId, dupTs1, dupTs2);
+      expect(ids.length).to.equal(2);
+    });
+
+    it("returns empty array for a pet that has no records at all", async function () {
+      const petId2 = await registerPet(other);
+      const ids = await registry.getPetRecordsByDateRange(petId2, 0, t2 + 99999);
+      expect(ids.length).to.equal(0);
+    });
+  });
+
 });
