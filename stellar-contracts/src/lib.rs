@@ -214,6 +214,8 @@ mod test_emergency_notify_rate_limit;
 #[cfg(test)]
 mod test_issues_100_101_102_103;
 #[cfg(test)]
+mod test_issues_198_199_200_201;
+#[cfg(test)]
 mod test_ownership_history_privacy;
 
 #[cfg(test)]
@@ -371,6 +373,14 @@ const STREAK_MILESTONE_DAYS: &[u64] = &[7, 30, 100, 365, 1000];
 
 // --- STORAGE QUOTA CONSTANTS ---
 const DEFAULT_STORAGE_QUOTA: u64 = 1000; // Default max storage entries per pet
+
+/// Maximum number of photo hashes that can be stored per pet (Issue #201).
+///
+/// The `photo_hashes` Vec is embedded inline inside `Pet` and serialised as a
+/// single XDR entry. An unbounded Vec would grow the entry on every call that
+/// loads the pet, inflating gas costs for all contract operations. 50 photos
+/// is a generous practical limit that keeps the entry size bounded.
+const MAX_PET_PHOTOS: u32 = 50;
 
 /// Minimum retention period enforced by set_retention_period (Issue #102).
 ///
@@ -1285,6 +1295,8 @@ pub enum EventType {
     GroomingRecordCreated,
     PolicyExpiringSoon,
     PolicyRenewed,
+    PetArchived,
+    PetUnarchived,
 }
 
 #[contracttype]
@@ -2466,6 +2478,26 @@ pub struct PetOwnershipTransferredEvent {
     pub pet_id: u64,
     pub old_owner: Address,
     pub new_owner: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when a pet is archived via archive_pet
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PetArchivedEvent {
+    pub version: u32,
+    pub pet_id: u64,
+    pub owner: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when a pet is unarchived via unarchive_pet
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PetUnarchivedEvent {
+    pub version: u32,
+    pub pet_id: u64,
+    pub owner: Address,
     pub timestamp: u64,
 }
 
@@ -6139,57 +6171,59 @@ impl KoraContract {
     }
 
     pub fn activate_pet(env: Env, id: u64) {
-        if let Some(mut pet) = env
+        let mut pet: Pet = env
             .storage()
             .instance()
             .get::<DataKey, Pet>(&DataKey::Pet(id))
-        {
-            pet.owner.require_auth();
-            if !pet.active {
-                let active_count: u64 = env
-                    .storage()
-                    .instance()
-                    .get(&StatsKey::ActivePetsCount)
-                    .unwrap_or(0);
-                env.storage()
-                    .instance()
-                    .set(&StatsKey::ActivePetsCount, &safe_increment(active_count));
-                Self::record_stat_point(
-                    &env,
-                    String::from_str(&env, "ActivePetsCount"),
-                    safe_increment(active_count),
-                );
-            }
-            pet.active = true;
-            pet.updated_at = env.ledger().timestamp();
-            Self::store_pet(&env, id, &pet);
+            .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
+        pet.owner.require_auth();
+        if pet.archived {
+            panic_with_error!(&env, ContractError::PetIsArchived);
         }
+        if !pet.active {
+            let active_count: u64 = env
+                .storage()
+                .instance()
+                .get(&StatsKey::ActivePetsCount)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&StatsKey::ActivePetsCount, &safe_increment(active_count));
+            Self::record_stat_point(
+                &env,
+                String::from_str(&env, "ActivePetsCount"),
+                safe_increment(active_count),
+            );
+        }
+        pet.active = true;
+        pet.updated_at = env.ledger().timestamp();
+        Self::store_pet(&env, id, &pet);
     }
 
     pub fn deactivate_pet(env: Env, id: u64) {
-        if let Some(mut pet) = Self::load_pet(&env, id) {
-            pet.owner.require_auth();
-            if pet.active {
-                let active_count: u64 = env
-                    .storage()
+        let mut pet: Pet = Self::load_pet(&env, id)
+            .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
+        pet.owner.require_auth();
+        if pet.active {
+            let active_count: u64 = env
+                .storage()
+                .instance()
+                .get(&StatsKey::ActivePetsCount)
+                .unwrap_or(0);
+            if active_count > 0 {
+                env.storage()
                     .instance()
-                    .get(&StatsKey::ActivePetsCount)
-                    .unwrap_or(0);
-                if active_count > 0 {
-                    env.storage()
-                        .instance()
-                        .set(&StatsKey::ActivePetsCount, &(active_count - 1));
-                    Self::record_stat_point(
-                        &env,
-                        String::from_str(&env, "ActivePetsCount"),
-                        active_count - 1,
-                    );
-                }
+                    .set(&StatsKey::ActivePetsCount, &(active_count - 1));
+                Self::record_stat_point(
+                    &env,
+                    String::from_str(&env, "ActivePetsCount"),
+                    active_count - 1,
+                );
             }
-            pet.active = false;
-            pet.updated_at = env.ledger().timestamp();
-            Self::store_pet(&env, id, &pet);
         }
+        pet.active = false;
+        pet.updated_at = env.ledger().timestamp();
+        Self::store_pet(&env, id, &pet);
     }
 
     pub fn archive_pet(env: Env, pet_id: u64) {
@@ -6215,8 +6249,18 @@ impl KoraContract {
         }
         pet.archived = true;
         pet.active = false;
-        pet.updated_at = env.ledger().timestamp();
+        let timestamp = env.ledger().timestamp();
+        pet.updated_at = timestamp;
         Self::store_pet(&env, pet_id, &pet);
+        env.events().publish(
+            (String::from_str(&env, "PetArchived"), pet_id),
+            PetArchivedEvent {
+                version: EVENT_SCHEMA_VERSION,
+                pet_id,
+                owner: pet.owner,
+                timestamp,
+            },
+        );
     }
 
     pub fn unarchive_pet(env: Env, pet_id: u64) {
@@ -6227,8 +6271,18 @@ impl KoraContract {
             .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
         pet.owner.require_auth();
         pet.archived = false;
-        pet.updated_at = env.ledger().timestamp();
+        let timestamp = env.ledger().timestamp();
+        pet.updated_at = timestamp;
         Self::store_pet(&env, pet_id, &pet);
+        env.events().publish(
+            (String::from_str(&env, "PetUnarchived"), pet_id),
+            PetUnarchivedEvent {
+                version: EVENT_SCHEMA_VERSION,
+                pet_id,
+                owner: pet.owner,
+                timestamp,
+            },
+        );
     }
 
     pub fn add_pet_photo(env: Env, pet_id: u64, photo_hash: String) -> bool {
@@ -6240,6 +6294,16 @@ impl KoraContract {
             pet.owner.require_auth();
             if let Err(err) = KoraContract::validate_ipfs_hash(&env, &photo_hash) {
                 env.panic_with_error(err);
+            }
+
+            // Reject duplicate photo hashes (Issue #201)
+            if pet.photo_hashes.contains(&photo_hash) {
+                panic_with_error!(&env, ContractError::DuplicateEntry);
+            }
+
+            // Enforce maximum photo limit (Issue #201)
+            if pet.photo_hashes.len() >= MAX_PET_PHOTOS {
+                panic_with_error!(&env, ContractError::StorageQuotaExceeded);
             }
 
             // Check storage quota (Issue #782)
