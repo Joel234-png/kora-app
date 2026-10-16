@@ -271,4 +271,45 @@ mod test_amend_diff_delete {
         assert!(client.delete_medical_record(&pet_id, &record_id, &admin));
         assert!(client.get_medical_record(&record_id).is_none());
     }
+
+    // -------------------------------------------------------------------------
+    // Issue #220 – Validate record.pet_id == pet_id in amend and diff
+    // -------------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #12)")]
+    fn test_amend_medical_record_mismatched_pet_id_rejected() {
+        let env = Env::default();
+        let (client, _admin, vet, _owner, pet_id) = setup(&env);
+        let record_id = add_record(&client, &env, &vet, pet_id);
+
+        let input = MedicalRecordAmendmentInput {
+            diagnosis: Some(String::from_str(&env, "Revised Diagnosis")),
+            treatment: Some(String::from_str(&env, "Revised Treatment")),
+            medications: None,
+            notes: None,
+        };
+
+        let mismatched_pet_id = pet_id + 999;
+        client.amend_medical_record(&mismatched_pet_id, &record_id, &vet, &input);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #12)")]
+    fn test_diff_record_versions_mismatched_pet_id_rejected() {
+        let env = Env::default();
+        let (client, _admin, vet, _owner, pet_id) = setup(&env);
+        let record_id = add_record(&client, &env, &vet, pet_id);
+
+        let input = MedicalRecordAmendmentInput {
+            diagnosis: Some(String::from_str(&env, "Updated Diagnosis")),
+            treatment: Some(String::from_str(&env, "Updated Treatment")),
+            medications: None,
+            notes: None,
+        };
+        client.amend_medical_record(&pet_id, &record_id, &vet, &input);
+
+        let mismatched_pet_id = pet_id + 999;
+        client.diff_record_versions(&mismatched_pet_id, &record_id, &0u32, &1u32);
+    }
 }
