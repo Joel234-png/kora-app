@@ -20,6 +20,9 @@ contract KoraRegistry is Pausable {
     /// @notice Maximum number of records scanned/returned in date-range query when limit is omitted.
     uint256 public constant MAX_QUERY_LIMIT = 100;
 
+    /// @notice Maximum page size for paginated record-type queries (issue #227).
+    uint256 public constant MAX_PAGE_SIZE = 50;
+
     // -------------------------------------------------------------------------
     // State
     // -------------------------------------------------------------------------
@@ -297,10 +300,13 @@ contract KoraRegistry is Pausable {
     }
 
     /// @notice Update the calling vet's own specialization.
-    /// @param specialization New specialization string.
+    /// @param specialization New specialization string (1–128 bytes).
     function updateSpecialization(string calldata specialization) external whenNotPaused {
         require(vets[msg.sender].vetAddress == msg.sender, "KoraRegistry: not a registered vet");
-        require(bytes(specialization).length <= 128, "KoraRegistry: invalid specialization length");
+        require(
+            bytes(specialization).length > 0 && bytes(specialization).length <= 128,
+            "KoraRegistry: invalid specialization length"
+        );
         vets[msg.sender].specialization = specialization;
         emit VetSpecializationUpdated(msg.sender, specialization);
     }
@@ -413,6 +419,7 @@ contract KoraRegistry is Pausable {
     /// @notice Deactivate a pet. Only callable by the pet's owner.
     /// @param petId ID of the pet to deactivate.
     function deactivatePet(uint256 petId) external onlyPetOwner(petId) whenNotPaused {
+        require(petId > 0 && petId <= _petCounter, "KoraRegistry: pet does not exist");
         require(pets[petId].active, "KoraRegistry: already inactive");
         pets[petId].active = false;
         emit PetDeactivated(petId);
@@ -421,6 +428,7 @@ contract KoraRegistry is Pausable {
     /// @notice Reactivate a previously deactivated pet. Only callable by the pet's owner.
     /// @param petId ID of the pet to reactivate.
     function reactivatePet(uint256 petId) external onlyPetOwner(petId) whenNotPaused {
+        require(petId > 0 && petId <= _petCounter, "KoraRegistry: pet does not exist");
         require(!pets[petId].active, "KoraRegistry: already active");
         pets[petId].active = true;
         emit PetReactivated(petId);
@@ -495,6 +503,58 @@ contract KoraRegistry is Pausable {
             if (all[i].recordType == recordType) {
                 filtered[j] = all[i];
                 j++;
+            }
+        }
+    }
+
+    /// @notice Return a paginated page of medical records for a pet filtered by record type.
+    /// @dev    Validates pet existence. `limit` is clamped to MAX_PAGE_SIZE.
+    /// @param petId      ID of the pet.
+    /// @param recordType Category to filter by.
+    /// @param offset     Number of matching records to skip (0-based).
+    /// @param limit      Maximum number of matching records to return (clamped to MAX_PAGE_SIZE).
+    /// @return page      Slice of matching MedicalRecord structs for the requested page.
+    function getPetRecordsByTypePaged(
+        uint256 petId,
+        RecordType recordType,
+        uint256 offset,
+        uint256 limit
+    ) external view returns (MedicalRecord[] memory page) {
+        require(pets[petId].owner != address(0), "KoraRegistry: pet does not exist");
+        if (limit == 0) {
+            return new MedicalRecord[](0);
+        }
+        if (limit > MAX_PAGE_SIZE) {
+            limit = MAX_PAGE_SIZE;
+        }
+
+        MedicalRecord[] storage all = _petRecords[petId];
+        uint256 total = all.length;
+
+        // Count total matching records to determine page boundaries
+        uint256 matchCount;
+        for (uint256 i = 0; i < total; i++) {
+            if (all[i].recordType == recordType) matchCount++;
+        }
+
+        if (offset >= matchCount) {
+            return new MedicalRecord[](0);
+        }
+
+        uint256 end = offset + limit;
+        if (end > matchCount) end = matchCount;
+        uint256 size = end - offset;
+
+        page = new MedicalRecord[](size);
+        uint256 matched;
+        uint256 j;
+        for (uint256 i = 0; i < total && j < size; i++) {
+            if (all[i].recordType == recordType) {
+                if (matched >= offset) {
+                    page[j] = all[i];
+                    j++;
+                }
+                matched++;
             }
         }
     }
@@ -603,6 +663,8 @@ contract KoraRegistry is Pausable {
         uint256 endDate,
         uint256 limit
     ) public view returns (uint256[] memory ids) {
+        require(pets[petId].owner != address(0), "KoraRegistry: pet does not exist");
+        require(startDate <= endDate, "KoraRegistry: invalid date range");
         if (limit == 0) {
             return new uint256[](0);
         }
