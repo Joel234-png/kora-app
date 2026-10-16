@@ -113,6 +113,8 @@ below. Discriminants `42` and `47`-`79` are unused.
 | 23 | `PetAlreadyHasLinkedTag` | `link_tag_to_pet` | Unlink the existing tag before linking a new one. |
 | 24 | `PetNotFound` | most pet-scoped entrypoints, e.g. `add_medical_record`, `add_vaccination`, `log_feeding`, `link_tag_to_pet`, `set_diet_plan`, `verify_custody_chain` | The pet id does not exist. Refresh the pet list before retrying. |
 | 25 | `StorageQuotaExceeded` | `add_attachment`, `get_record_encrypted_payload`, `increment_pet_storage` | The pet's storage quota is full. Ask an admin to raise it with `set_pet_storage_quota` / `set_global_storage_quota`, or purge records first. |
+| 169 | `InvalidRecipient` | `transfer_pet_ownership` | The recipient address is the current owner. Supply a different recipient address. |
+| 170 | `PetIsArchived` | `transfer_pet_ownership` | The pet is archived and cannot be transferred. |
 
 #### Veterinarians, certificates and vaccinations
 
@@ -202,6 +204,7 @@ below. Discriminants `42` and `47`-`79` are unused.
 | 23 | `PetAlreadyHasLinkedTag` | 161 | `RecordAlreadyDeleted` |
 | 24 | `PetNotFound` | 162 | `RetentionPeriodNotMet` |
 | 25 | `StorageQuotaExceeded` | 163 | `RecordNotFound` |
+| 169 | `InvalidRecipient` | 170 | `PetIsArchived` |
 
 ### `KoraError` — keyword search and lineage validation
 
@@ -263,7 +266,7 @@ the escrow module means something different from a `3` from `KoraContract`.
 | 33 | `InputStringTooLong` | A string input exceeds its limit. |
 | 34 | `AdoptionNotExpired` | The adoption request has not expired yet. |
 | 35 | `TransferDisputed` | The transfer has an active dispute. |
-| 36 | `InvalidInput` | A function argument is invalid (e.g. empty rejection reason). |
+| 36 | `InvalidInput` | A function argument is invalid (e.g. pet_id is 0). |
 
 <!-- check-error-codes: enum=EscrowError file=stellar-contracts/contracts/pet-transfer-adoption/src/escrow.rs -->
 

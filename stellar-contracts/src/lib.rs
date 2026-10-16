@@ -163,6 +163,8 @@ use soroban_sdk::{
 };
 
 #[cfg(test)]
+mod test_issues_202_203_204_205;
+#[cfg(test)]
 mod test_behavior_records;
 #[cfg(test)]
 mod test_dispute_voting;
@@ -212,7 +214,15 @@ mod test_emergency_notify_rate_limit;
 #[cfg(test)]
 mod test_issues_100_101_102_103;
 #[cfg(test)]
+mod test_issues_198_199_200_201;
+#[cfg(test)]
 mod test_ownership_history_privacy;
+#[cfg(test)]
+mod test_recovery_tag_transfer;
+#[cfg(test)]
+mod test_remove_attachment;
+#[cfg(test)]
+mod test_grooming_slot_booking;
 
 #[cfg(test)]
 mod test_access_control;
@@ -323,6 +333,7 @@ const MAX_SEARCH_TOKENS_PER_RECORD: u32 = 16;
 #[allow(dead_code)]
 const MAX_SEARCH_NOTES_LEN: u32 = 512;
 const MAX_LINEAGE_DEPTH: u32 = 16;
+pub const MAX_ALLOWED_LINEAGE_DEPTH: u32 = 8;
 const MAX_LOG_ENTRIES: u32 = 1_000;
 const MAX_ACTIVE_SUBSCRIPTIONS_PER_ADDRESS: u32 = 10;
 const MAX_BATCH_ERROR_MESSAGES: usize = 128;
@@ -332,6 +343,16 @@ const MAX_BATCH_ERROR_MESSAGES: usize = 128;
 /// adversarial or buggy client flood one record and silently exhaust the pet
 /// owner's storage quota. `add_attachment` enforces this cap. (Issue #774 / Wave 9 #99)
 const MAX_ATTACHMENTS_PER_RECORD: u32 = 10;
+
+/// Minimum bookable grooming-slot duration, in minutes. Sub-slot bookings
+/// would only produce noise on a groomer's calendar, so `book_grooming_slot`
+/// rejects anything shorter. (Issue #217)
+const MIN_GROOMING_SLOT_MINS: u64 = 15;
+
+/// Maximum bookable grooming-slot duration, in minutes (8 hours). A single
+/// unbounded reservation could otherwise block a groomer's calendar for
+/// weeks. `book_grooming_slot` rejects anything longer. (Issue #217)
+const MAX_GROOMING_SLOT_MINS: u64 = 480;
 
 /// Maximum plausible weight for a pet, in grams (500 kg). Rejects both
 /// zero-weight entries and unrealistic values that would corrupt dosage
@@ -368,6 +389,14 @@ const STREAK_MILESTONE_DAYS: &[u64] = &[7, 30, 100, 365, 1000];
 
 // --- STORAGE QUOTA CONSTANTS ---
 const DEFAULT_STORAGE_QUOTA: u64 = 1000; // Default max storage entries per pet
+
+/// Maximum number of photo hashes that can be stored per pet (Issue #201).
+///
+/// The `photo_hashes` Vec is embedded inline inside `Pet` and serialised as a
+/// single XDR entry. An unbounded Vec would grow the entry on every call that
+/// loads the pet, inflating gas costs for all contract operations. 50 photos
+/// is a generous practical limit that keeps the entry size bounded.
+const MAX_PET_PHOTOS: u32 = 50;
 
 /// Minimum retention period enforced by set_retention_period (Issue #102).
 ///
@@ -487,6 +516,8 @@ pub enum ContractError {
     CircularLineage = 166,
     KeywordTooLong = 167,
     TooManySearchTokens = 168,
+    InvalidRecipient = 169,
+    PetIsArchived = 170,
 }
 
 // --- MULTI-LANGUAGE ERROR REGISTRY (Issue #684) ---
@@ -863,6 +894,15 @@ pub struct WeightEntry {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WeightRecordedEvent {
+    pub pet_id: u64,
+    pub weight: u32,
+    pub recorded_by: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PetData {
     pub name: String,
     pub species: String,
@@ -1179,6 +1219,15 @@ pub struct TagReactivatedEvent {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TagUnlinkedEvent {
+    pub tag_id: BytesN<32>,
+    pub pet_id: u64,
+    pub owner: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub struct PetTag {
     pub tag_id: BytesN<32>,
@@ -1233,6 +1282,9 @@ pub enum DataKey {
     NonceUsage((u64, String, Bytes)),
     RetentionPeriod,
     MaxSubscriptionsPerAddress,
+    PendingPetTransfer(u64),
+    VerifiedVetCount,
+    VerifiedVetIndex(u64),
 }
 
 #[contracttype]
@@ -1259,6 +1311,8 @@ pub enum EventType {
     GroomingRecordCreated,
     PolicyExpiringSoon,
     PolicyRenewed,
+    PetArchived,
+    PetUnarchived,
 }
 
 #[contracttype]
@@ -2440,6 +2494,26 @@ pub struct PetOwnershipTransferredEvent {
     pub pet_id: u64,
     pub old_owner: Address,
     pub new_owner: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when a pet is archived via archive_pet
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PetArchivedEvent {
+    pub version: u32,
+    pub pet_id: u64,
+    pub owner: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when a pet is unarchived via unarchive_pet
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PetUnarchivedEvent {
+    pub version: u32,
+    pub pet_id: u64,
+    pub owner: Address,
     pub timestamp: u64,
 }
 
@@ -4362,7 +4436,7 @@ impl KoraContract {
         }
 
         invoker.require_auth();
-        if !admins.contains(invoker) {
+        if !admins.contains(invoker.clone()) {
             panic_with_error!(&env, ContractError::InvokerNotInAdminList);
         }
 
@@ -4370,12 +4444,11 @@ impl KoraContract {
             env.storage()
                 .instance()
                 .set(&DataKey::Admin, &invoker);
-        } else {
-            env.storage().instance().set(&SystemKey::Admins, &admins);
-            env.storage()
-                .instance()
-                .set(&SystemKey::AdminThreshold, &threshold);
         }
+        env.storage().instance().set(&SystemKey::Admins, &admins);
+        env.storage()
+            .instance()
+            .set(&SystemKey::AdminThreshold, &threshold);
         env.storage().instance().set(
             &DataKey::ContractVersion,
             &ContractVersion {
@@ -6149,57 +6222,59 @@ impl KoraContract {
     }
 
     pub fn activate_pet(env: Env, id: u64) {
-        if let Some(mut pet) = env
+        let mut pet: Pet = env
             .storage()
             .instance()
             .get::<DataKey, Pet>(&DataKey::Pet(id))
-        {
-            pet.owner.require_auth();
-            if !pet.active {
-                let active_count: u64 = env
-                    .storage()
-                    .instance()
-                    .get(&StatsKey::ActivePetsCount)
-                    .unwrap_or(0);
-                env.storage()
-                    .instance()
-                    .set(&StatsKey::ActivePetsCount, &safe_increment(active_count));
-                Self::record_stat_point(
-                    &env,
-                    String::from_str(&env, "ActivePetsCount"),
-                    safe_increment(active_count),
-                );
-            }
-            pet.active = true;
-            pet.updated_at = env.ledger().timestamp();
-            Self::store_pet(&env, id, &pet);
+            .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
+        pet.owner.require_auth();
+        if pet.archived {
+            panic_with_error!(&env, ContractError::PetIsArchived);
         }
+        if !pet.active {
+            let active_count: u64 = env
+                .storage()
+                .instance()
+                .get(&StatsKey::ActivePetsCount)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&StatsKey::ActivePetsCount, &safe_increment(active_count));
+            Self::record_stat_point(
+                &env,
+                String::from_str(&env, "ActivePetsCount"),
+                safe_increment(active_count),
+            );
+        }
+        pet.active = true;
+        pet.updated_at = env.ledger().timestamp();
+        Self::store_pet(&env, id, &pet);
     }
 
     pub fn deactivate_pet(env: Env, id: u64) {
-        if let Some(mut pet) = Self::load_pet(&env, id) {
-            pet.owner.require_auth();
-            if pet.active {
-                let active_count: u64 = env
-                    .storage()
+        let mut pet: Pet = Self::load_pet(&env, id)
+            .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
+        pet.owner.require_auth();
+        if pet.active {
+            let active_count: u64 = env
+                .storage()
+                .instance()
+                .get(&StatsKey::ActivePetsCount)
+                .unwrap_or(0);
+            if active_count > 0 {
+                env.storage()
                     .instance()
-                    .get(&StatsKey::ActivePetsCount)
-                    .unwrap_or(0);
-                if active_count > 0 {
-                    env.storage()
-                        .instance()
-                        .set(&StatsKey::ActivePetsCount, &(active_count - 1));
-                    Self::record_stat_point(
-                        &env,
-                        String::from_str(&env, "ActivePetsCount"),
-                        active_count - 1,
-                    );
-                }
+                    .set(&StatsKey::ActivePetsCount, &(active_count - 1));
+                Self::record_stat_point(
+                    &env,
+                    String::from_str(&env, "ActivePetsCount"),
+                    active_count - 1,
+                );
             }
-            pet.active = false;
-            pet.updated_at = env.ledger().timestamp();
-            Self::store_pet(&env, id, &pet);
         }
+        pet.active = false;
+        pet.updated_at = env.ledger().timestamp();
+        Self::store_pet(&env, id, &pet);
     }
 
     pub fn archive_pet(env: Env, pet_id: u64) {
@@ -6225,8 +6300,18 @@ impl KoraContract {
         }
         pet.archived = true;
         pet.active = false;
-        pet.updated_at = env.ledger().timestamp();
+        let timestamp = env.ledger().timestamp();
+        pet.updated_at = timestamp;
         Self::store_pet(&env, pet_id, &pet);
+        env.events().publish(
+            (String::from_str(&env, "PetArchived"), pet_id),
+            PetArchivedEvent {
+                version: EVENT_SCHEMA_VERSION,
+                pet_id,
+                owner: pet.owner,
+                timestamp,
+            },
+        );
     }
 
     pub fn unarchive_pet(env: Env, pet_id: u64) {
@@ -6237,8 +6322,18 @@ impl KoraContract {
             .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
         pet.owner.require_auth();
         pet.archived = false;
-        pet.updated_at = env.ledger().timestamp();
+        let timestamp = env.ledger().timestamp();
+        pet.updated_at = timestamp;
         Self::store_pet(&env, pet_id, &pet);
+        env.events().publish(
+            (String::from_str(&env, "PetUnarchived"), pet_id),
+            PetUnarchivedEvent {
+                version: EVENT_SCHEMA_VERSION,
+                pet_id,
+                owner: pet.owner,
+                timestamp,
+            },
+        );
     }
 
     pub fn add_pet_photo(env: Env, pet_id: u64, photo_hash: String) -> bool {
@@ -6250,6 +6345,16 @@ impl KoraContract {
             pet.owner.require_auth();
             if let Err(err) = KoraContract::validate_ipfs_hash(&env, &photo_hash) {
                 env.panic_with_error(err);
+            }
+
+            // Reject duplicate photo hashes (Issue #201)
+            if pet.photo_hashes.contains(&photo_hash) {
+                panic_with_error!(&env, ContractError::DuplicateEntry);
+            }
+
+            // Enforce maximum photo limit (Issue #201)
+            if pet.photo_hashes.len() >= MAX_PET_PHOTOS {
+                panic_with_error!(&env, ContractError::StorageQuotaExceeded);
             }
 
             // Check storage quota (Issue #782)
@@ -6374,21 +6479,29 @@ impl KoraContract {
     }
 
     pub fn transfer_pet_ownership(env: Env, id: u64, to: Address, nonce: u64) {
-        if let Some(mut pet) = env
+        let mut pet = env
             .storage()
             .instance()
             .get::<DataKey, Pet>(&DataKey::Pet(id))
-        {
-            let owner = pet.owner.clone();
-            owner.require_auth();
-            Self::consume_caller_nonce(&env, &owner, nonce);
-            pet.new_owner = to;
-            pet.updated_at = env.ledger().timestamp();
-            env.storage()
-                .instance()
-                .set(&DataKey::PendingPetTransfer(id), &pet.new_owner);
-            env.storage().instance().set(&DataKey::Pet(id), &pet);
+            .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
+
+        if pet.archived {
+            env.panic_with_error(ContractError::PetIsArchived);
         }
+
+        if to == pet.owner {
+            env.panic_with_error(ContractError::InvalidRecipient);
+        }
+
+        let owner = pet.owner.clone();
+        owner.require_auth();
+        Self::consume_caller_nonce(&env, &owner, nonce);
+        pet.new_owner = to;
+        pet.updated_at = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingPetTransfer(id), &pet.new_owner);
+        env.storage().instance().set(&DataKey::Pet(id), &pet);
     }
 
     /// Grant a grantee access to a pet. The caller must be the pet owner and
@@ -6410,8 +6523,18 @@ impl KoraContract {
             owner.require_auth();
             Self::consume_caller_nonce(&env, &owner, nonce);
 
-            let key = DataKey::AccessGrant((pet_id, grantee.clone()));
+            if grantee == owner {
+                panic_with_error!(&env, ContractError::InvalidInput);
+            }
+
             let now = env.ledger().timestamp();
+            if let Some(ts) = expires_at {
+                if ts <= now {
+                    panic_with_error!(&env, ContractError::InvalidInput);
+                }
+            }
+
+            let key = DataKey::AccessGrant((pet_id, grantee.clone()));
             let mut grant = if let Some(existing) = env
                 .storage()
                 .instance()
@@ -6638,6 +6761,11 @@ impl KoraContract {
 
             Self::store_pet(&env, id, &pet);
 
+            // Keep any linked recovery tag pointing at the current legal
+            // owner, so `get_tag` never reports a former owner once the
+            // transfer is accepted. (Issue #214)
+            KoraContract::update_linked_tag_owner(&env, id, &pet.owner);
+
             KoraContract::log_ownership_change(
                 &env,
                 id,
@@ -6832,6 +6960,22 @@ impl KoraContract {
     ) -> bool {
         owner.require_auth();
 
+        if name.len() == 0 {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
+        if name.len() > KoraContract::MAX_STR_SHORT {
+            panic_with_error!(&env, ContractError::InputStringTooLong);
+        }
+
+        if email.len() > KoraContract::MAX_STR_SHORT {
+            panic_with_error!(&env, ContractError::InputStringTooLong);
+        }
+
+        if emergency_contact.len() > KoraContract::MAX_STR_SHORT {
+            panic_with_error!(&env, ContractError::InputStringTooLong);
+        }
+
         if let Some(mut pet_owner) = env
             .storage()
             .instance()
@@ -6914,6 +7058,12 @@ impl KoraContract {
     const MAX_DAILY_CALORIES: u32 = 20_000;
     const MAX_NUTRITION_TEXT_LEN: u32 = 100;
     const MAX_NUTRITION_INGREDIENTS: u32 = 50;
+    /// Maximum number of biomarkers allowed per lab result submission.
+    /// Enforced in `add_lab_result` to bound per-call storage I/O (Issue #208).
+    const MAX_BIOMARKERS_PER_RESULT: u32 = 15;
+    /// Maximum number of dietary restrictions or allergies per diet plan.
+    /// Enforced in `set_diet_plan` to cap storage usage (Issue #209).
+    const MAX_DIET_ITEMS: u32 = 10;
 
     /// Dispute resolution bounds
     #[allow(dead_code)]
@@ -7044,35 +7194,26 @@ impl KoraContract {
         let count: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::VetCount)
+            .get(&DataKey::VerifiedVetCount)
             .unwrap_or(0);
         let mut result = Vec::new(&env);
-        if count == 0 || limit == 0 {
+        if count == 0 || limit == 0 || offset >= count {
             return result;
         }
-        let mut skipped = 0u64;
-        for i in 1..=count {
+        let start = offset + 1;
+        let end = (offset + limit as u64).min(count);
+        for i in start..=end {
             if let Some(addr) = env
                 .storage()
                 .instance()
-                .get::<DataKey, Address>(&DataKey::VetIndex(i))
+                .get::<DataKey, Address>(&DataKey::VerifiedVetIndex(i))
             {
                 if let Some(vet) = env
                     .storage()
                     .instance()
                     .get::<DataKey, Vet>(&DataKey::Vet(addr))
                 {
-                    if !vet.verified || env.ledger().timestamp() > vet.license_expiry {
-                        continue;
-                    }
-                    if skipped < offset {
-                        skipped += 1;
-                        continue;
-                    }
                     result.push_back(vet);
-                    if result.len() >= limit {
-                        break;
-                    }
                 }
             }
         }
@@ -7108,21 +7249,9 @@ impl KoraContract {
 
         // Process each vet address
         for vet_address in vet_addresses.iter() {
-            // Check if vet exists
-            if let Some(mut vet) = env
-                .storage()
-                .instance()
-                .get::<DataKey, Vet>(&DataKey::Vet(vet_address.clone()))
-            {
-                // Vet exists, verify it
-                vet.verified = true;
-                vet.license_expiry = u64::MAX;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Vet(vet.address.clone()), &vet);
+            if Self::_verify_vet_internal(&env, vet_address.clone()) {
                 succeeded.push_back(vet_address.clone());
             } else {
-                // Vet not found, record failure
                 failed.push_back((vet_address.clone(), ContractError::VetNotFound as u32));
             }
         }
@@ -7200,16 +7329,31 @@ impl KoraContract {
         if let Some(mut vet) = env
             .storage()
             .instance()
-            .get::<DataKey, Vet>(&DataKey::Vet(vet_address))
+            .get::<DataKey, Vet>(&DataKey::Vet(vet_address.clone()))
         {
-            vet.verified = true;
-            vet.license_expiry = u64::MAX;
-            env.storage()
-                .instance()
-                .set(&DataKey::Vet(vet.address.clone()), &vet);
-            env.storage()
-                .instance()
-                .remove(&DataKey::RevokedVet(vet_address));
+            if !vet.verified {
+                vet.verified = true;
+                vet.license_expiry = u64::MAX;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Vet(vet_address.clone()), &vet);
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::RevokedVet(vet_address.clone()));
+
+                let count: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::VerifiedVetCount)
+                    .unwrap_or(0);
+                let new_count = safe_increment(count);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::VerifiedVetCount, &new_count);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::VerifiedVetIndex(new_count), &vet_address);
+            }
             true
         } else {
             false
@@ -7229,15 +7373,57 @@ impl KoraContract {
         if let Some(mut vet) = env
             .storage()
             .instance()
-            .get::<DataKey, Vet>(&DataKey::Vet(vet_address))
+            .get::<DataKey, Vet>(&DataKey::Vet(vet_address.clone()))
         {
-            vet.verified = false;
-            env.storage()
-                .instance()
-                .set(&DataKey::Vet(vet.address.clone()), &vet);
-            env.storage()
-                .instance()
-                .set(&DataKey::RevokedVet(vet_address), &true);
+            if vet.verified {
+                vet.verified = false;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Vet(vet_address.clone()), &vet);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::RevokedVet(vet_address.clone()), &true);
+
+                let count: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::VerifiedVetCount)
+                    .unwrap_or(0);
+
+                let mut remove_index = None;
+                for i in 1..=count {
+                    if let Some(addr) = env
+                        .storage()
+                        .instance()
+                        .get::<DataKey, Address>(&DataKey::VerifiedVetIndex(i))
+                    {
+                        if addr == vet_address {
+                            remove_index = Some(i);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(idx) = remove_index {
+                    if idx != count {
+                        if let Some(last_addr) = env
+                            .storage()
+                            .instance()
+                            .get::<DataKey, Address>(&DataKey::VerifiedVetIndex(count))
+                        {
+                            env.storage()
+                                .instance()
+                                .set(&DataKey::VerifiedVetIndex(idx), &last_addr);
+                        }
+                    }
+                    env.storage()
+                        .instance()
+                        .remove(&DataKey::VerifiedVetIndex(count));
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::VerifiedVetCount, &(count - 1));
+                }
+            }
             true
         } else {
             false
@@ -7364,8 +7550,27 @@ impl KoraContract {
         batch_number: String,
     ) -> u64 {
         veterinarian.require_auth();
+        // Issue #206: use structured error instead of untyped string panic.
         if !KoraContract::is_verified_vet(env.clone(), veterinarian.clone()) {
-            panic!("Veterinarian not verified");
+            panic_with_error!(&env, ContractError::VetNotVerified);
+        }
+
+        // Issue #207: vaccine_name and batch_number must not exceed MAX_STR_SHORT.
+        if vaccine_name.len() > Self::MAX_STR_SHORT {
+            panic_with_error!(&env, ContractError::InputStringTooLong);
+        }
+        if batch_number.len() > Self::MAX_STR_SHORT {
+            panic_with_error!(&env, ContractError::InputStringTooLong);
+        }
+
+        // Issue #207: administered_at must not be in the future.
+        let now = env.ledger().timestamp();
+        if administered_at > now {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+        // Issue #207: next_due_date must be on or after administered_at.
+        if next_due_date < administered_at {
+            panic_with_error!(&env, ContractError::InvalidInput);
         }
 
         if expires_at <= administered_at {
@@ -7389,7 +7594,6 @@ impl KoraContract {
         let vaccine_id = vaccine_count
             .checked_add(1)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::CounterOverflow));
-        let now = env.ledger().timestamp();
         let key = KoraContract::get_encryption_key(&env);
 
         let vname_bytes = vaccine_name.to_xdr(&env);
@@ -7605,6 +7809,11 @@ impl KoraContract {
         // Issue #92: reference range must be a valid interval.
         if ref_min >= ref_max {
             panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
+        // Issue #208: cap biomarkers map to prevent runaway storage I/O.
+        if biomarkers.len() > Self::MAX_BIOMARKERS_PER_RESULT {
+            panic_with_error!(&env, ContractError::TooManyItems);
         }
 
         // --- allocate ID ---
@@ -8342,6 +8551,14 @@ impl KoraContract {
 
         pet.owner.require_auth();
 
+        // Issue #209: string parameters must not exceed MAX_STR_SHORT.
+        if food_type.len() > Self::MAX_STR_SHORT
+            || portion_size.len() > Self::MAX_STR_SHORT
+            || frequency.len() > Self::MAX_STR_SHORT
+        {
+            panic_with_error!(&env, ContractError::InputStringTooLong);
+        }
+
         if calories_per_serving < Self::MIN_DAILY_CALORIES
             || calories_per_serving > Self::MAX_DAILY_CALORIES
             || daily_target_calories < Self::MIN_DAILY_CALORIES
@@ -8349,11 +8566,24 @@ impl KoraContract {
             || food_type.is_empty()
             || portion_size.is_empty()
             || frequency.is_empty()
-            || food_type.len() > Self::MAX_NUTRITION_TEXT_LEN
-            || portion_size.len() > Self::MAX_NUTRITION_TEXT_LEN
-            || frequency.len() > Self::MAX_NUTRITION_TEXT_LEN
         {
             panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
+        // Issue #209: cap restrictions and allergies at 10 items each.
+        if restrictions.len() > Self::MAX_DIET_ITEMS || allergies.len() > Self::MAX_DIET_ITEMS {
+            panic_with_error!(&env, ContractError::TooManyItems);
+        }
+        // Issue #209: each restriction and allergy entry must not exceed MAX_STR_SHORT.
+        for item in restrictions.iter() {
+            if item.len() > Self::MAX_STR_SHORT {
+                panic_with_error!(&env, ContractError::InputStringTooLong);
+            }
+        }
+        for item in allergies.iter() {
+            if item.len() > Self::MAX_STR_SHORT {
+                panic_with_error!(&env, ContractError::InputStringTooLong);
+            }
         }
 
         let diet_count: u64 = env
@@ -8446,18 +8676,19 @@ impl KoraContract {
     }
 
     pub fn get_current_diet_plan(env: Env, pet_id: u64) -> Option<DietPlan> {
-        let history = KoraContract::get_diet_history(env, pet_id);
-        let mut current: Option<DietPlan> = None;
-        for plan in history.iter() {
-            let replace = match current {
-                None => true,
-                Some(ref c) => plan.created_at > c.created_at,
-            };
-            if replace {
-                current = Some(plan);
-            }
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&NutritionKey::PetDietCount(pet_id))
+            .unwrap_or(0);
+        if count == 0 {
+            return None;
         }
-        current
+        let did = env
+            .storage()
+            .instance()
+            .get::<NutritionKey, u64>(&NutritionKey::PetDietByIndex((pet_id, count)))?;
+        KoraContract::get_diet_plan(env, did)
     }
 
     /// Returns the total number of diet plans recorded for a given pet.
@@ -8499,6 +8730,10 @@ impl KoraContract {
             .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
 
         pet.owner.require_auth();
+
+        if servings == 0 {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
 
         // Reject feeding logs materially dated in the future — see
         // `CLOCK_SKEW_TOLERANCE` doc comment. (Issue #70)
@@ -8659,6 +8894,16 @@ impl KoraContract {
         pet.weight = weight;
         pet.updated_at = now;
         Self::store_pet(&env, pet_id, &pet);
+
+        env.events().publish(
+            (Symbol::new(&env, "WeightRecorded"), pet_id),
+            WeightRecordedEvent {
+                pet_id,
+                weight,
+                recorded_by: pet.owner.clone(),
+                timestamp: now,
+            },
+        );
 
         true
     }
@@ -9189,6 +9434,55 @@ impl KoraContract {
         );
 
         tag_id
+    }
+
+    pub fn unlink_tag(env: Env, pet_id: u64) -> bool {
+        let pet = env
+            .storage()
+            .instance()
+            .get::<DataKey, Pet>(&DataKey::Pet(pet_id))
+            .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
+        pet.owner.require_auth();
+
+        let tag_id = match env
+            .storage()
+            .instance()
+            .get::<TagKey, BytesN<32>>(&TagKey::PetTagId(pet_id))
+        {
+            Some(id) => id,
+            None => return false,
+        };
+
+        // Clear PetTagId(pet_id) from instance storage
+        env.storage()
+            .instance()
+            .remove(&TagKey::PetTagId(pet_id));
+
+        // Mark tag inactive
+        if let Some(mut tag) = env
+            .storage()
+            .instance()
+            .get::<TagKey, PetTag>(&TagKey::Tag(tag_id.clone()))
+        {
+            tag.is_active = false;
+            tag.updated_at = env.ledger().timestamp();
+            env.storage()
+                .instance()
+                .set(&TagKey::Tag(tag_id.clone()), &tag);
+        }
+
+        let now = env.ledger().timestamp();
+        env.events().publish(
+            (String::from_str(&env, "TAG_UNLINKED"),),
+            TagUnlinkedEvent {
+                tag_id,
+                pet_id,
+                owner: pet.owner.clone(),
+                timestamp: now,
+            },
+        );
+
+        true
     }
 
     pub fn get_pet_by_tag(env: Env, tag_id: BytesN<32>) -> Option<PetProfile> {
@@ -9929,6 +10223,78 @@ impl KoraContract {
             Some(record) => record.attachment_hashes.len(),
             None => 0,
         }
+    }
+
+    /// Remove an attachment from a medical record by its IPFS hash.
+    ///
+    /// Only the authoring vet or the pet's current owner may remove an
+    /// attachment (Issue #215). A successful removal deletes the matching
+    /// entry from the record's attachment list and releases one unit of the
+    /// pet's storage quota consumed by `add_attachment` (Wave 9 #102), so an
+    /// erroneously uploaded file no longer permanently consumes quota.
+    ///
+    /// Panics with [`ContractError::RecordNotFound`] if the record does not
+    /// exist, [`ContractError::Unauthorized`] if the caller is neither the
+    /// authoring vet nor the pet owner, and [`ContractError::InvalidInput`]
+    /// if no attachment matches `ipfs_hash`.
+    pub fn remove_attachment(
+        env: Env,
+        record_id: u64,
+        ipfs_hash: String,
+        caller: Address,
+    ) -> bool {
+        caller.require_auth();
+
+        let mut record: MedicalRecord = env
+            .storage()
+            .instance()
+            .get(&MedicalKey::MedicalRecord(record_id))
+            .unwrap_or_else(|| env.panic_with_error(ContractError::RecordNotFound));
+
+        let pet: Pet = env
+            .storage()
+            .instance()
+            .get(&DataKey::Pet(record.pet_id))
+            .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
+
+        if caller != record.vet_address && caller != pet.owner {
+            panic_with_error!(&env, ContractError::Unauthorized);
+        }
+
+        // Soroban `Vec` has no in-place removal, so rebuild the list without
+        // the matching entry.
+        let mut remaining: Vec<Attachment> = Vec::new(&env);
+        let mut found = false;
+        for attachment in record.attachment_hashes.iter() {
+            if attachment.ipfs_hash == ipfs_hash {
+                found = true;
+            } else {
+                remaining.push_back(attachment);
+            }
+        }
+        if !found {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
+        record.attachment_hashes = remaining;
+        record.updated_at = env.ledger().timestamp();
+
+        env.storage()
+            .instance()
+            .set(&MedicalKey::MedicalRecord(record_id), &record);
+
+        // Release the quota unit consumed when the attachment was added.
+        Self::decrement_pet_storage(&env, record.pet_id);
+
+        Self::log_access(
+            &env,
+            record.pet_id,
+            caller,
+            AccessAction::Write,
+            String::from_str(&env, "Attachment removed from medical record"),
+        );
+
+        true
     }
 
     fn log_ownership_change(
@@ -11786,6 +12152,16 @@ impl KoraContract {
     ) -> u64 {
         owner.require_auth();
 
+        // (Issue #217) Only future start times with sane durations may be
+        // booked: reject past/now bookings and zero-minute or multi-week
+        // holds that would block the groomer's calendar.
+        if start_time <= env.ledger().timestamp() {
+            panic_with_error!(env, ContractError::InvalidInput);
+        }
+        if duration_mins < MIN_GROOMING_SLOT_MINS || duration_mins > MAX_GROOMING_SLOT_MINS {
+            panic_with_error!(env, ContractError::InvalidInput);
+        }
+
         // Check the pet exists and caller is the owner
         let pet: Pet = env
             .storage()
@@ -11835,6 +12211,12 @@ impl KoraContract {
             .get(&GroomingKey::GroomingRecordCount)
             .unwrap_or(0u64)
             .saturating_add(1);
+        // Persist the incremented counter so subsequent bookings receive
+        // monotonically increasing unique IDs instead of always 1.
+        // (Issue #216)
+        env.storage()
+            .instance()
+            .set(&GroomingKey::GroomingRecordCount, &slot_id);
 
         let new_slot = GroomingSlot {
             slot_id,
@@ -12797,12 +13179,41 @@ impl KoraContract {
             .set(&BreedingKey::PetBreedingCount(pet_id), &(count + 1));
     }
 
-    pub fn add_offspring(env: Env, record_id: u64, offspring_id: u64) -> bool {
+    pub fn add_offspring(env: Env, record_id: u64, offspring_id: u64, caller: Address) -> bool {
+        caller.require_auth();
+
         let mut record: BreedingRecord = env
             .storage()
             .persistent()
             .get(&BreedingKey::BreedingRecord(record_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::PetNotFound));
+
+        let offspring: Pet = env
+            .storage()
+            .instance()
+            .get(&DataKey::Pet(offspring_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::PetNotFound));
+
+        let sire_owner = env
+            .storage()
+            .instance()
+            .get::<DataKey, Pet>(&DataKey::Pet(record.sire_id))
+            .map(|p| p.owner);
+        let dam_owner = env
+            .storage()
+            .instance()
+            .get::<DataKey, Pet>(&DataKey::Pet(record.dam_id))
+            .map(|p| p.owner);
+
+        let is_authorized = caller == offspring.owner
+            || sire_owner.as_ref() == Some(&caller)
+            || dam_owner.as_ref() == Some(&caller)
+            || record.breeder == caller
+            || Self::is_admin_address(&env, &caller);
+
+        if !is_authorized {
+            panic_with_error!(&env, ContractError::Unauthorized);
+        }
 
         // Self-lineage check
         if offspring_id == record.sire_id || offspring_id == record.dam_id {
@@ -12870,6 +13281,9 @@ impl KoraContract {
     }
 
     pub fn get_lineage(env: Env, pet_id: u64, max_depth: u32) -> Vec<u64> {
+        if max_depth > MAX_ALLOWED_LINEAGE_DEPTH {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
         Self::collect_lineage_vec(&env, pet_id, max_depth)
     }
 
@@ -13084,6 +13498,10 @@ impl KoraContract {
             .instance()
             .get(&SystemKey::Admins)
             .unwrap_or_else(|| env.panic_with_error(ContractError::AdminsNotSet));
+
+        if !admins.contains(&admin_to_remove) {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
 
         let threshold: u32 = env
             .storage()
@@ -13848,8 +14266,10 @@ impl KoraContract {
     }
 
     pub fn amend_medical_record(env: Env, pet_id: u64, record_id: u64, caller: Address, input: MedicalRecordAmendmentInput) -> u32 {
-        let _ = pet_id;
         let record: MedicalRecord = Self::load_medical_record(&env, record_id).unwrap_or_else(|| panic_with_error!(&env, ContractError::RecordNotFound));
+        if record.pet_id != pet_id {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
         record.vet_address.require_auth();
         let version: u32 = env.storage().instance().get::<MedicalKey, u32>(&MedicalKey::MedicalRecordAmendmentCount(record_id)).unwrap_or(0);
         if version >= 5 { panic_with_error!(&env, ContractError::TooManyItems); }
@@ -13880,7 +14300,10 @@ impl KoraContract {
     }
 
     pub fn diff_record_versions(env: Env, pet_id: u64, record_id: u64, from_version: u32, to_version: u32) -> Vec<MedicalFieldDiff> {
-        let _ = pet_id;
+        let record: MedicalRecord = Self::load_medical_record(&env, record_id).unwrap_or_else(|| panic_with_error!(&env, ContractError::RecordNotFound));
+        if record.pet_id != pet_id {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
         let max_version: u32 = env.storage().instance().get::<MedicalKey, u32>(&MedicalKey::MedicalRecordAmendmentCount(record_id)).unwrap_or(0);
         // to_version must be a valid stored version (1..=max_version)
         if to_version == 0 || to_version > max_version {
