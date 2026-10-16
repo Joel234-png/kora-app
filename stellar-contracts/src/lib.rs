@@ -13050,6 +13050,10 @@ impl KoraContract {
             .get(&SystemKey::Admins)
             .unwrap_or_else(|| env.panic_with_error(ContractError::AdminsNotSet));
 
+        if !admins.contains(&admin_to_remove) {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
         let threshold: u32 = env
             .storage()
             .instance()
