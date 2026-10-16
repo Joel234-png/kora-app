@@ -864,6 +864,15 @@ pub struct WeightEntry {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WeightRecordedEvent {
+    pub pet_id: u64,
+    pub weight: u32,
+    pub recorded_by: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PetData {
     pub name: String,
     pub species: String,
@@ -1176,6 +1185,15 @@ pub struct TagReactivatedEvent {
     pub tag_id: BytesN<32>,
     pub pet_id: u64,
     pub reactivated_by: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TagUnlinkedEvent {
+    pub tag_id: BytesN<32>,
+    pub pet_id: u64,
+    pub owner: Address,
     pub timestamp: u64,
 }
 
@@ -8411,18 +8429,19 @@ impl KoraContract {
     }
 
     pub fn get_current_diet_plan(env: Env, pet_id: u64) -> Option<DietPlan> {
-        let history = KoraContract::get_diet_history(env, pet_id);
-        let mut current: Option<DietPlan> = None;
-        for plan in history.iter() {
-            let replace = match current {
-                None => true,
-                Some(ref c) => plan.created_at > c.created_at,
-            };
-            if replace {
-                current = Some(plan);
-            }
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&NutritionKey::PetDietCount(pet_id))
+            .unwrap_or(0);
+        if count == 0 {
+            return None;
         }
-        current
+        let did = env
+            .storage()
+            .instance()
+            .get::<NutritionKey, u64>(&NutritionKey::PetDietByIndex((pet_id, count)))?;
+        KoraContract::get_diet_plan(env, did)
     }
 
     /// Returns the total number of diet plans recorded for a given pet.
@@ -8464,6 +8483,10 @@ impl KoraContract {
             .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
 
         pet.owner.require_auth();
+
+        if servings == 0 {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
 
         // Reject feeding logs materially dated in the future — see
         // `CLOCK_SKEW_TOLERANCE` doc comment. (Issue #70)
@@ -8624,6 +8647,16 @@ impl KoraContract {
         pet.weight = weight;
         pet.updated_at = now;
         Self::store_pet(&env, pet_id, &pet);
+
+        env.events().publish(
+            (Symbol::new(&env, "WeightRecorded"), pet_id),
+            WeightRecordedEvent {
+                pet_id,
+                weight,
+                recorded_by: pet.owner.clone(),
+                timestamp: now,
+            },
+        );
 
         true
     }
@@ -9154,6 +9187,55 @@ impl KoraContract {
         );
 
         tag_id
+    }
+
+    pub fn unlink_tag(env: Env, pet_id: u64) -> bool {
+        let pet = env
+            .storage()
+            .instance()
+            .get::<DataKey, Pet>(&DataKey::Pet(pet_id))
+            .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
+        pet.owner.require_auth();
+
+        let tag_id = match env
+            .storage()
+            .instance()
+            .get::<TagKey, BytesN<32>>(&TagKey::PetTagId(pet_id))
+        {
+            Some(id) => id,
+            None => return false,
+        };
+
+        // Clear PetTagId(pet_id) from instance storage
+        env.storage()
+            .instance()
+            .remove(&TagKey::PetTagId(pet_id));
+
+        // Mark tag inactive
+        if let Some(mut tag) = env
+            .storage()
+            .instance()
+            .get::<TagKey, PetTag>(&TagKey::Tag(tag_id.clone()))
+        {
+            tag.is_active = false;
+            tag.updated_at = env.ledger().timestamp();
+            env.storage()
+                .instance()
+                .set(&TagKey::Tag(tag_id.clone()), &tag);
+        }
+
+        let now = env.ledger().timestamp();
+        env.events().publish(
+            (String::from_str(&env, "TAG_UNLINKED"),),
+            TagUnlinkedEvent {
+                tag_id,
+                pet_id,
+                owner: pet.owner.clone(),
+                timestamp: now,
+            },
+        );
+
+        true
     }
 
     pub fn get_pet_by_tag(env: Env, tag_id: BytesN<32>) -> Option<PetProfile> {
