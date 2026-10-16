@@ -212,6 +212,8 @@ mod test_emergency_notify_rate_limit;
 #[cfg(test)]
 mod test_issues_100_101_102_103;
 #[cfg(test)]
+mod test_issues_206_207_208_209;
+#[cfg(test)]
 mod test_ownership_history_privacy;
 
 #[cfg(test)]
@@ -6879,6 +6881,12 @@ impl KoraContract {
     const MAX_DAILY_CALORIES: u32 = 20_000;
     const MAX_NUTRITION_TEXT_LEN: u32 = 100;
     const MAX_NUTRITION_INGREDIENTS: u32 = 50;
+    /// Maximum number of biomarkers allowed per lab result submission.
+    /// Enforced in `add_lab_result` to bound per-call storage I/O (Issue #208).
+    const MAX_BIOMARKERS_PER_RESULT: u32 = 15;
+    /// Maximum number of dietary restrictions or allergies per diet plan.
+    /// Enforced in `set_diet_plan` to cap storage usage (Issue #209).
+    const MAX_DIET_ITEMS: u32 = 10;
 
     /// Dispute resolution bounds
     #[allow(dead_code)]
@@ -7329,8 +7337,27 @@ impl KoraContract {
         batch_number: String,
     ) -> u64 {
         veterinarian.require_auth();
+        // Issue #206: use structured error instead of untyped string panic.
         if !KoraContract::is_verified_vet(env.clone(), veterinarian.clone()) {
-            panic!("Veterinarian not verified");
+            panic_with_error!(&env, ContractError::VetNotVerified);
+        }
+
+        // Issue #207: vaccine_name and batch_number must not exceed MAX_STR_SHORT.
+        if vaccine_name.len() > Self::MAX_STR_SHORT {
+            panic_with_error!(&env, ContractError::InputStringTooLong);
+        }
+        if batch_number.len() > Self::MAX_STR_SHORT {
+            panic_with_error!(&env, ContractError::InputStringTooLong);
+        }
+
+        // Issue #207: administered_at must not be in the future.
+        let now = env.ledger().timestamp();
+        if administered_at > now {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+        // Issue #207: next_due_date must be on or after administered_at.
+        if next_due_date < administered_at {
+            panic_with_error!(&env, ContractError::InvalidInput);
         }
 
         if expires_at <= administered_at {
@@ -7354,7 +7381,6 @@ impl KoraContract {
         let vaccine_id = vaccine_count
             .checked_add(1)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::CounterOverflow));
-        let now = env.ledger().timestamp();
         let key = KoraContract::get_encryption_key(&env);
 
         let vname_bytes = vaccine_name.to_xdr(&env);
@@ -7570,6 +7596,11 @@ impl KoraContract {
         // Issue #92: reference range must be a valid interval.
         if ref_min >= ref_max {
             panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
+        // Issue #208: cap biomarkers map to prevent runaway storage I/O.
+        if biomarkers.len() > Self::MAX_BIOMARKERS_PER_RESULT {
+            panic_with_error!(&env, ContractError::TooManyItems);
         }
 
         // --- allocate ID ---
@@ -8307,6 +8338,14 @@ impl KoraContract {
 
         pet.owner.require_auth();
 
+        // Issue #209: string parameters must not exceed MAX_STR_SHORT.
+        if food_type.len() > Self::MAX_STR_SHORT
+            || portion_size.len() > Self::MAX_STR_SHORT
+            || frequency.len() > Self::MAX_STR_SHORT
+        {
+            panic_with_error!(&env, ContractError::InputStringTooLong);
+        }
+
         if calories_per_serving < Self::MIN_DAILY_CALORIES
             || calories_per_serving > Self::MAX_DAILY_CALORIES
             || daily_target_calories < Self::MIN_DAILY_CALORIES
@@ -8314,11 +8353,24 @@ impl KoraContract {
             || food_type.is_empty()
             || portion_size.is_empty()
             || frequency.is_empty()
-            || food_type.len() > Self::MAX_NUTRITION_TEXT_LEN
-            || portion_size.len() > Self::MAX_NUTRITION_TEXT_LEN
-            || frequency.len() > Self::MAX_NUTRITION_TEXT_LEN
         {
             panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
+        // Issue #209: cap restrictions and allergies at 10 items each.
+        if restrictions.len() > Self::MAX_DIET_ITEMS || allergies.len() > Self::MAX_DIET_ITEMS {
+            panic_with_error!(&env, ContractError::TooManyItems);
+        }
+        // Issue #209: each restriction and allergy entry must not exceed MAX_STR_SHORT.
+        for item in restrictions.iter() {
+            if item.len() > Self::MAX_STR_SHORT {
+                panic_with_error!(&env, ContractError::InputStringTooLong);
+            }
+        }
+        for item in allergies.iter() {
+            if item.len() > Self::MAX_STR_SHORT {
+                panic_with_error!(&env, ContractError::InputStringTooLong);
+            }
         }
 
         let diet_count: u64 = env
