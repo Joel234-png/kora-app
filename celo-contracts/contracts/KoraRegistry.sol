@@ -707,6 +707,9 @@ contract KoraRegistry is Pausable {
         if (offset >= total || limit == 0) {
             return new uint256[](0);
         }
+        if (limit > MAX_PAGE_SIZE) {
+            limit = MAX_PAGE_SIZE;
+        }
         uint256 end = offset + limit;
         if (end > total) end = total;
         uint256 size = end - offset;
@@ -731,6 +734,9 @@ contract KoraRegistry is Pausable {
         if (offset >= total || limit == 0) {
             return new MedicalRecord[](0);
         }
+        if (limit > MAX_PAGE_SIZE) {
+            limit = MAX_PAGE_SIZE;
+        }
         uint256 end = offset + limit;
         if (end > total) end = total;
         uint256 size = end - offset;
@@ -752,6 +758,9 @@ contract KoraRegistry is Pausable {
         uint256 total = _vetAddresses.length;
         if (offset >= total || limit == 0) {
             return new Vet[](0);
+        }
+        if (limit > MAX_PAGE_SIZE) {
+            limit = MAX_PAGE_SIZE;
         }
         uint256 end = offset + limit;
         if (end > total) end = total;
