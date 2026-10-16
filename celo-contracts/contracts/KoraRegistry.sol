@@ -20,6 +20,9 @@ contract KoraRegistry is Pausable {
     /// @notice Maximum number of records scanned/returned in date-range query when limit is omitted.
     uint256 public constant MAX_QUERY_LIMIT = 100;
 
+    /// @notice Maximum number of items returned per invocation in paginated view functions.
+    uint256 public constant MAX_PAGE_LIMIT = 100;
+
     // -------------------------------------------------------------------------
     // State
     // -------------------------------------------------------------------------
@@ -300,7 +303,11 @@ contract KoraRegistry is Pausable {
     /// @param specialization New specialization string.
     function updateSpecialization(string calldata specialization) external whenNotPaused {
         require(vets[msg.sender].vetAddress == msg.sender, "KoraRegistry: not a registered vet");
-        require(bytes(specialization).length <= 128, "KoraRegistry: invalid specialization length");
+        require(!vets[msg.sender].isRevoked, "KoraRegistry: vet revoked");
+        require(
+            bytes(specialization).length > 0 && bytes(specialization).length <= MAX_SHORT_LEN,
+            "KoraRegistry: invalid specialization length"
+        );
         vets[msg.sender].specialization = specialization;
         emit VetSpecializationUpdated(msg.sender, specialization);
     }
@@ -570,10 +577,18 @@ contract KoraRegistry is Pausable {
         return pets[petId].active;
     }
 
+    /// @notice Whether `petId` has been registered in the system.
+    /// @param petId The pet to query.
+    /// @return      True if the pet exists (active or deactivated), false if not registered.
+    function petExists(uint256 petId) public view returns (bool) {
+        return pets[petId].owner != address(0);
+    }
+
     /// @notice Return all medical records for a pet.
     /// @param petId ID of the pet to query.
     /// @return      Full array of MedicalRecord structs for the pet.
     function getPetRecords(uint256 petId) external view returns (MedicalRecord[] memory) {
+        require(pets[petId].owner != address(0), "KoraRegistry: pet does not exist");
         return _petRecords[petId];
     }
 
@@ -640,6 +655,9 @@ contract KoraRegistry is Pausable {
         uint256 offset,
         uint256 limit
     ) external view returns (uint256[] memory page) {
+        if (limit > MAX_PAGE_LIMIT) {
+            limit = MAX_PAGE_LIMIT;
+        }
         uint256[] storage all = _ownerPets[owner];
         uint256 total = all.length;
         if (offset >= total || limit == 0) {
@@ -664,6 +682,9 @@ contract KoraRegistry is Pausable {
         uint256 offset,
         uint256 limit
     ) external view returns (MedicalRecord[] memory page) {
+        if (limit > MAX_PAGE_LIMIT) {
+            limit = MAX_PAGE_LIMIT;
+        }
         MedicalRecord[] storage all = _petRecords[petId];
         uint256 total = all.length;
         if (offset >= total || limit == 0) {
@@ -687,6 +708,9 @@ contract KoraRegistry is Pausable {
     /// @param limit  Maximum number of Vet structs to return.
     /// @return page  Slice of Vet structs for the requested page.
     function getVets(uint256 offset, uint256 limit) external view returns (Vet[] memory page) {
+        if (limit > MAX_PAGE_LIMIT) {
+            limit = MAX_PAGE_LIMIT;
+        }
         uint256 total = _vetAddresses.length;
         if (offset >= total || limit == 0) {
             return new Vet[](0);
