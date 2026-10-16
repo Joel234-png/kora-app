@@ -5227,6 +5227,12 @@ impl KoraContract {
         }
         Self::validate_pet_name(&env, &name);
         Self::validate_breed(&env, &species, &breed);
+        if color.len() == 0 || color.len() > Self::MAX_STR_SHORT {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+        if weight == 0 {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
 
         if let Some(microchip) = microchip_id.clone() {
             if env
@@ -5422,97 +5428,126 @@ impl KoraContract {
         microchip_id: Option<String>,
         privacy_level: PrivacyLevel,
     ) -> bool {
-        if let Some(mut pet) = Self::load_pet(&env, id) {
-            pet.owner.require_auth();
-            if let Err(err) = KoraContract::parse_birthday_timestamp(&birthday) {
-                env.panic_with_error(err);
-            }
-            Self::validate_pet_name(&env, &name);
-            Self::validate_breed(&env, &species, &breed);
+        let mut pet = Self::load_pet(&env, id)
+            .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
+        pet.owner.require_auth();
+        if let Err(err) = KoraContract::parse_birthday_timestamp(&birthday) {
+            env.panic_with_error(err);
+        }
+        Self::validate_pet_name(&env, &name);
+        Self::validate_breed(&env, &species, &breed);
 
-            if microchip_id != pet.microchip_id {
-                if let Some(microchip) = microchip_id.clone() {
-                    if env
-                        .storage()
-                        .instance()
-                        .get::<DataKey, u64>(&DataKey::PetByMicrochip(microchip))
-                        .map(|pet_id| pet_id != id)
-                        .unwrap_or(false)
-                    {
-                        panic_with_error!(&env, ContractError::InvalidInput);
-                    }
-                }
-                if let Some(previous_microchip) = pet.microchip_id.clone() {
-                    env.storage()
-                        .instance()
-                        .remove(&DataKey::PetByMicrochip(previous_microchip));
+        if microchip_id != pet.microchip_id {
+            if let Some(microchip) = microchip_id.clone() {
+                if env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, u64>(&DataKey::PetByMicrochip(microchip))
+                    .map(|pet_id| pet_id != id)
+                    .unwrap_or(false)
+                {
+                    panic_with_error!(&env, ContractError::InvalidInput);
                 }
             }
-
-            let key = KoraContract::get_encryption_key(&env);
-
-            let name_bytes = name.to_xdr(&env);
-            let (name_nonce, name_ciphertext) = encrypt_sensitive_data(&env, &name_bytes, &key);
-            pet.encrypted_name = EncryptedData {
-                nonce: name_nonce,
-                ciphertext: name_ciphertext,
-            };
-
-            let birthday_bytes = birthday.to_xdr(&env);
-            let (birthday_nonce, birthday_ciphertext) =
-                encrypt_sensitive_data(&env, &birthday_bytes, &key);
-            pet.encrypted_birthday = EncryptedData {
-                nonce: birthday_nonce,
-                ciphertext: birthday_ciphertext,
-            };
-
-            let breed_bytes = breed.to_xdr(&env);
-            let (breed_nonce, breed_ciphertext) = encrypt_sensitive_data(&env, &breed_bytes, &key);
-            pet.encrypted_breed = EncryptedData {
-                nonce: breed_nonce,
-                ciphertext: breed_ciphertext,
-            };
-
-            pet.gender = gender;
-            pet.species = species;
-            pet.privacy_level = privacy_level;
-            pet.color = color;
-            pet.weight = weight;
-            pet.microchip_id = microchip_id;
-            pet.updated_at = env.ledger().timestamp();
-
-            env.storage().instance().set(&DataKey::Pet(id), &pet);
-            if let Some(microchip) = pet.microchip_id.clone() {
+            if let Some(previous_microchip) = pet.microchip_id.clone() {
                 env.storage()
                     .instance()
-                    .set(&DataKey::PetByMicrochip(microchip), &id);
+                    .remove(&DataKey::PetByMicrochip(previous_microchip));
             }
-            KoraContract::log_access(
-                &env,
-                id,
-                pet.owner.clone(),
-                AccessAction::Write,
-                String::from_str(&env, "Pet profile updated"),
-            );
-            let timestamp = env.ledger().timestamp();
-            env.events().publish(
-                (String::from_str(&env, "PetProfileUpdated"), id),
-                PetProfileUpdatedEvent {
-                    version: EVENT_SCHEMA_VERSION,
-                    pet_id: id,
-                    owner: pet.owner,
-                    timestamp,
-                    subscription_ids: Self::matching_subscription_ids(
-                        &env,
-                        EventType::PetProfileUpdated,
-                        id,
-                    ),
-                },
-            );
-            true
-        } else {
-            false
         }
+
+        let key = KoraContract::get_encryption_key(&env);
+
+        let name_bytes = name.to_xdr(&env);
+        let (name_nonce, name_ciphertext) = encrypt_sensitive_data(&env, &name_bytes, &key);
+        pet.encrypted_name = EncryptedData {
+            nonce: name_nonce,
+            ciphertext: name_ciphertext,
+        };
+
+        let birthday_bytes = birthday.to_xdr(&env);
+        let (birthday_nonce, birthday_ciphertext) =
+            encrypt_sensitive_data(&env, &birthday_bytes, &key);
+        pet.encrypted_birthday = EncryptedData {
+            nonce: birthday_nonce,
+            ciphertext: birthday_ciphertext,
+        };
+
+        let breed_bytes = breed.to_xdr(&env);
+        let (breed_nonce, breed_ciphertext) = encrypt_sensitive_data(&env, &breed_bytes, &key);
+        pet.encrypted_breed = EncryptedData {
+            nonce: breed_nonce,
+            ciphertext: breed_ciphertext,
+        };
+
+        if species != pet.species {
+            let old_species_key = KoraContract::species_to_string(&env, &pet.species);
+            let prev_old_count: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SpeciesPetCount(old_species_key.clone()))
+                .unwrap_or(0);
+            let new_old_count = prev_old_count.saturating_sub(1);
+            env.storage()
+                .instance()
+                .set(&DataKey::SpeciesPetCount(old_species_key), &new_old_count);
+
+            let new_species_key = KoraContract::species_to_string(&env, &species);
+            let prev_new_count: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SpeciesPetCount(new_species_key.clone()))
+                .unwrap_or(0);
+            let new_species_count = prev_new_count
+                .checked_add(1)
+                .unwrap_or_else(|| env.panic_with_error(ContractError::CounterOverflow));
+            env.storage().instance().set(
+                &DataKey::SpeciesPetCount(new_species_key.clone()),
+                &new_species_count,
+            );
+            env.storage().instance().set(
+                &DataKey::SpeciesPetIndex((new_species_key, new_species_count)),
+                &id,
+            );
+        }
+
+        pet.gender = gender;
+        pet.species = species;
+        pet.privacy_level = privacy_level;
+        pet.color = color;
+        pet.weight = weight;
+        pet.microchip_id = microchip_id;
+        pet.updated_at = env.ledger().timestamp();
+
+        env.storage().instance().set(&DataKey::Pet(id), &pet);
+        if let Some(microchip) = pet.microchip_id.clone() {
+            env.storage()
+                .instance()
+                .set(&DataKey::PetByMicrochip(microchip), &id);
+        }
+        KoraContract::log_access(
+            &env,
+            id,
+            pet.owner.clone(),
+            AccessAction::Write,
+            String::from_str(&env, "Pet profile updated"),
+        );
+        let timestamp = env.ledger().timestamp();
+        env.events().publish(
+            (String::from_str(&env, "PetProfileUpdated"), id),
+            PetProfileUpdatedEvent {
+                version: EVENT_SCHEMA_VERSION,
+                pet_id: id,
+                owner: pet.owner,
+                timestamp,
+                subscription_ids: Self::matching_subscription_ids(
+                    &env,
+                    EventType::PetProfileUpdated,
+                    id,
+                ),
+            },
+        );
+        true
     }
 
     pub fn update_pet_privacy_level(env: Env, pet_id: u64, privacy_level: PrivacyLevel) -> bool {

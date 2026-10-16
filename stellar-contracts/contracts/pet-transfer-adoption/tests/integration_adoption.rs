@@ -98,3 +98,50 @@ fn finalize_transfer_records_custody_chain_entry() {
         "direct transfers must be logged with TransferType::Direct"
     );
 }
+
+#[test]
+fn reject_adoption_rejects_empty_reason() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+    let adopter = Address::generate(&env);
+    let pet_id = 100;
+
+    client.create_pet(&pet_id, &owner);
+    client.sign_adoption(&pet_id, &adopter, &None);
+
+    let empty_reason = soroban_sdk::String::from_str(&env, "");
+    let result = client.try_reject_adoption(&pet_id, &owner, &empty_reason);
+
+    assert_eq!(
+        result,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            pet_transfer_adoption::ContractError::InvalidInput as u32,
+        )))
+    );
+}
+
+#[test]
+fn reject_adoption_accepts_valid_non_empty_reason() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+    let adopter = Address::generate(&env);
+    let pet_id = 101;
+
+    client.create_pet(&pet_id, &owner);
+    client.sign_adoption(&pet_id, &adopter, &None);
+
+    let reason = soroban_sdk::String::from_str(&env, "Unable to accommodate pet");
+    client.reject_adoption(&pet_id, &owner, &reason);
+
+    assert!(client.get_pending_adoption(&pet_id).is_none());
+    let record = client.get_adoption_record(&pet_id).unwrap();
+    assert_eq!(record.state, pet_transfer_adoption::AdoptionState::Rejected);
+    assert_eq!(record.rejection_reason, Some(reason));
+}
+

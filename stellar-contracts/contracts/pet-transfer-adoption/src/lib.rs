@@ -275,6 +275,7 @@ pub enum ContractError {
     /// Returned when an attempt is made to expire or reclaim a transfer
     /// that has an active (unresolved) dispute. (Issue #62)
     TransferDisputed = 35,
+    InvalidInput = 36,
 }
 
 /// ======================================================
@@ -856,6 +857,9 @@ impl PetOwnershipContract {
     /// Reject a pending adoption. Any participant may cancel the adoption.
     pub fn reject_adoption(env: Env, pet_id: u64, rejector: Address, reason: String) {
         rejector.require_auth();
+        if reason.len() == 0 {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
         validate_len(&env, &reason, MAX_REJECTION_REASON_LEN);
 
         let pending: PendingAdoption = env
