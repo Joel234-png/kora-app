@@ -13,32 +13,20 @@ async function main() {
   console.log(`KoraRegistry deployed to: ${address}`);
   console.log(`Network: ${hre.network.name}`);
 
-  // Verify on-chain bytecode exists at the deployed address before writing the artifact.
-  const code = await hre.ethers.provider.getCode(address);
-  if (!code || code === "0x") {
-    throw new Error(`No bytecode found at deployed address ${address}`);
+  const deploymentsDir = path.join(__dirname, "..", "deployments");
+  if (!fs.existsSync(deploymentsDir)) {
+    fs.mkdirSync(deploymentsDir, { recursive: true });
   }
 
-  const deploymentTx = registry.deploymentTransaction();
-  const receipt = deploymentTx ? await deploymentTx.wait() : null;
-
   const artifact = {
-    contractName: "KoraRegistry",
     address,
     network: hre.network.name,
-    chainId: Number((await hre.ethers.provider.getNetwork()).chainId),
-    deployer: deployer.address,
-    blockNumber: receipt ? receipt.blockNumber : null,
     timestamp: new Date().toISOString(),
   };
 
-  const deploymentsDir = path.join(__dirname, "..", "deployments");
-  fs.mkdirSync(deploymentsDir, { recursive: true });
-
   const artifactPath = path.join(deploymentsDir, `${hre.network.name}.json`);
-  fs.writeFileSync(artifactPath, JSON.stringify(artifact, null, 2) + "\n");
-
-  console.log(`Deployment artifact written to: ${artifactPath}`);
+  fs.writeFileSync(artifactPath, JSON.stringify(artifact, null, 2));
+  console.log(`Deployment artifact written to deployments/${hre.network.name}.json`);
 
   return address;
 }

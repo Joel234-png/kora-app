@@ -999,6 +999,115 @@ describe("KoraRegistry", function () {
         registry.connect(owner).registerPet(PET.name, PET.species, PET.breed, PET.birthday)
       ).to.not.be.reverted;
     });
+
+    // ── Issue #234: comprehensive pause coverage for all whenNotPaused mutators
+
+    it("blocks verifyVet while paused", async function () {
+      await registry.connect(other).registerVet("LIC-002", "Surgery");
+      await registry.connect(admin).pause();
+      await expect(
+        registry.connect(admin).verifyVet(other.address)
+      ).to.be.revertedWithCustomError(registry, "EnforcedPause");
+    });
+
+    it("blocks revokeVet while paused", async function () {
+      await registry.connect(admin).pause();
+      await expect(
+        registry.connect(admin).revokeVet(vet.address)
+      ).to.be.revertedWithCustomError(registry, "EnforcedPause");
+    });
+
+    it("blocks deactivatePet while paused", async function () {
+      const petId = await registerPet();
+      await registry.connect(admin).pause();
+      await expect(
+        registry.connect(owner).deactivatePet(petId)
+      ).to.be.revertedWithCustomError(registry, "EnforcedPause");
+    });
+
+    it("blocks reactivatePet while paused", async function () {
+      const petId = await registerPet();
+      await registry.connect(owner).deactivatePet(petId);
+      await registry.connect(admin).pause();
+      await expect(
+        registry.connect(owner).reactivatePet(petId)
+      ).to.be.revertedWithCustomError(registry, "EnforcedPause");
+    });
+
+    it("blocks updateSpecialization while paused", async function () {
+      await registry.connect(admin).pause();
+      await expect(
+        registry.connect(vet).updateSpecialization("Cardiology")
+      ).to.be.revertedWithCustomError(registry, "EnforcedPause");
+    });
+
+    it("blocks acceptPetTransfer while paused", async function () {
+      const petId = await registerPet();
+      await registry.connect(owner).initiatePetTransfer(petId, other.address);
+      await registry.connect(admin).pause();
+      await expect(
+        registry.connect(other).acceptPetTransfer(petId)
+      ).to.be.revertedWithCustomError(registry, "EnforcedPause");
+    });
+
+    it("blocks cancelPetTransfer while paused", async function () {
+      const petId = await registerPet();
+      await registry.connect(owner).initiatePetTransfer(petId, other.address);
+      await registry.connect(admin).pause();
+      await expect(
+        registry.connect(owner).cancelPetTransfer(petId)
+      ).to.be.revertedWithCustomError(registry, "EnforcedPause");
+    });
+
+    it("verifyVet succeeds after unpause", async function () {
+      await registry.connect(other).registerVet("LIC-002", "Surgery");
+      await registry.connect(admin).pause();
+      await registry.connect(admin).unpause();
+      await expect(registry.connect(admin).verifyVet(other.address)).to.not.be.reverted;
+      expect((await registry.vets(other.address)).isVerified).to.equal(true);
+    });
+
+    it("revokeVet succeeds after unpause", async function () {
+      await registry.connect(admin).pause();
+      await registry.connect(admin).unpause();
+      await expect(registry.connect(admin).revokeVet(vet.address)).to.not.be.reverted;
+      expect((await registry.vets(vet.address)).isRevoked).to.equal(true);
+    });
+
+    it("deactivatePet succeeds after unpause", async function () {
+      const petId = await registerPet();
+      await registry.connect(admin).pause();
+      await registry.connect(admin).unpause();
+      await expect(registry.connect(owner).deactivatePet(petId)).to.not.be.reverted;
+      expect((await registry.pets(petId)).active).to.equal(false);
+    });
+
+    it("reactivatePet succeeds after unpause", async function () {
+      const petId = await registerPet();
+      await registry.connect(owner).deactivatePet(petId);
+      await registry.connect(admin).pause();
+      await registry.connect(admin).unpause();
+      await expect(registry.connect(owner).reactivatePet(petId)).to.not.be.reverted;
+      expect((await registry.pets(petId)).active).to.equal(true);
+    });
+
+    it("addMedicalRecord succeeds after unpause", async function () {
+      const petId = await registerPet();
+      await registry.connect(admin).pause();
+      await registry.connect(admin).unpause();
+      await expect(
+        registry.connect(vet).addMedicalRecord(petId, 0, "flu", "rest", "")
+      ).to.not.be.reverted;
+    });
+
+    it("transferPet (initiate → accept) succeeds after unpause", async function () {
+      const petId = await registerPet();
+      await registry.connect(admin).pause();
+      await registry.connect(admin).unpause();
+      await registry.connect(owner).initiatePetTransfer(petId, other.address);
+      await expect(registry.connect(other).acceptPetTransfer(petId)).to.not.be.reverted;
+      expect((await registry.pets(petId)).owner).to.equal(other.address);
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -1072,6 +1181,87 @@ describe("KoraRegistry", function () {
   });
 
   // ---------------------------------------------------------------------------
-  // Issue #920 — correctMedicalRecord
+  // Issues #223, #224, #225 — Pagination limits
   // ---------------------------------------------------------------------------
+
+  // ---------------------------------------------------------------------------
+  // Issue #233 — getPetRecordsByDateRange edge cases
+  // ---------------------------------------------------------------------------
+  describe("getPetRecordsByDateRange edge cases", function () {
+    let petId, t0, t1, t2;
+
+    beforeEach(async function () {
+      petId = await registerPet();
+      const base = (await ethers.provider.getBlock("latest")).timestamp;
+      t0 = base + 1000;
+      t1 = base + 2000;
+      t2 = base + 3000;
+      for (const ts of [t0, t1, t2]) {
+        await network.provider.send("evm_setNextBlockTimestamp", [ts]);
+        await registry.connect(vet).addMedicalRecord(petId, 0, "diag", "treat", "");
+      }
+    });
+
+    it("includes a record whose timestamp equals the exact startDate boundary", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t0, t0);
+      expect(ids.length).to.equal(1);
+    });
+
+    it("includes a record whose timestamp equals the exact endDate boundary", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t2, t2);
+      expect(ids.length).to.equal(1);
+    });
+
+    it("includes records where startDate == endDate == middle timestamp (single-point range)", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t1, t1);
+      expect(ids.length).to.equal(1);
+    });
+
+    it("returns empty array when range falls strictly between two records", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t0 + 1, t1 - 1);
+      expect(ids.length).to.equal(0);
+    });
+
+    it("returns empty array when range is entirely before all records", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, 0, t0 - 1);
+      expect(ids.length).to.equal(0);
+    });
+
+    it("returns empty array when range is entirely after all records", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t2 + 1, t2 + 9999);
+      expect(ids.length).to.equal(0);
+    });
+
+    it("returns all three records when range spans [startDate=t0, endDate=t2]", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t0, t2);
+      expect(ids.length).to.equal(3);
+    });
+
+    it("returns only the two records inside a partial range [t0, t1]", async function () {
+      const ids = await registry.getPetRecordsByDateRange(petId, t0, t1);
+      expect(ids.length).to.equal(2);
+    });
+
+    it("returns correct filtering when multiple records share the same timestamp", async function () {
+      // Mine two more records at timestamps that are very close together but adjacent
+      const dupTs1 = t2 + 10;
+      const dupTs2 = t2 + 11;
+      await network.provider.send("evm_setNextBlockTimestamp", [dupTs1]);
+      await registry.connect(vet).addMedicalRecord(petId, 0, "dup1", "treat", "");
+      await network.provider.send("evm_setNextBlockTimestamp", [dupTs2]);
+      await registry.connect(vet).addMedicalRecord(petId, 0, "dup2", "treat", "");
+
+      // Range exactly covering both duplicate records
+      const ids = await registry.getPetRecordsByDateRange(petId, dupTs1, dupTs2);
+      expect(ids.length).to.equal(2);
+    });
+
+    it("returns empty array for a pet that has no records at all", async function () {
+      const petId2 = await registerPet(other);
+      const ids = await registry.getPetRecordsByDateRange(petId2, 0, t2 + 99999);
+      expect(ids.length).to.equal(0);
+    });
+  });
+
 });
+

@@ -41,6 +41,10 @@ async function main() {
     })
     .find((parsed) => parsed && parsed.name === "PetRegistered");
 
+  if (!event || !event.args) {
+    throw new Error("PetRegistered event not found in transaction receipt");
+  }
+
   console.log(`Pet registered with petId: ${event.args.petId}`);
 }
 
