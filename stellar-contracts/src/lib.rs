@@ -163,6 +163,8 @@ use soroban_sdk::{
 };
 
 #[cfg(test)]
+mod test_issues_202_203_204_205;
+#[cfg(test)]
 mod test_behavior_records;
 #[cfg(test)]
 mod test_dispute_voting;
@@ -487,6 +489,8 @@ pub enum ContractError {
     CircularLineage = 166,
     KeywordTooLong = 167,
     TooManySearchTokens = 168,
+    InvalidRecipient = 169,
+    PetIsArchived = 170,
 }
 
 // --- MULTI-LANGUAGE ERROR REGISTRY (Issue #684) ---
@@ -1233,6 +1237,9 @@ pub enum DataKey {
     NonceUsage((u64, String, Bytes)),
     RetentionPeriod,
     MaxSubscriptionsPerAddress,
+    PendingPetTransfer(u64),
+    VerifiedVetCount,
+    VerifiedVetIndex(u64),
 }
 
 #[contracttype]
@@ -6339,21 +6346,29 @@ impl KoraContract {
     }
 
     pub fn transfer_pet_ownership(env: Env, id: u64, to: Address, nonce: u64) {
-        if let Some(mut pet) = env
+        let mut pet = env
             .storage()
             .instance()
             .get::<DataKey, Pet>(&DataKey::Pet(id))
-        {
-            let owner = pet.owner.clone();
-            owner.require_auth();
-            Self::consume_caller_nonce(&env, &owner, nonce);
-            pet.new_owner = to;
-            pet.updated_at = env.ledger().timestamp();
-            env.storage()
-                .instance()
-                .set(&DataKey::PendingPetTransfer(id), &pet.new_owner);
-            env.storage().instance().set(&DataKey::Pet(id), &pet);
+            .unwrap_or_else(|| env.panic_with_error(ContractError::PetNotFound));
+
+        if pet.archived {
+            env.panic_with_error(ContractError::PetIsArchived);
         }
+
+        if to == pet.owner {
+            env.panic_with_error(ContractError::InvalidRecipient);
+        }
+
+        let owner = pet.owner.clone();
+        owner.require_auth();
+        Self::consume_caller_nonce(&env, &owner, nonce);
+        pet.new_owner = to;
+        pet.updated_at = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingPetTransfer(id), &pet.new_owner);
+        env.storage().instance().set(&DataKey::Pet(id), &pet);
     }
 
     /// Grant a grantee access to a pet. The caller must be the pet owner and
@@ -6375,8 +6390,18 @@ impl KoraContract {
             owner.require_auth();
             Self::consume_caller_nonce(&env, &owner, nonce);
 
-            let key = DataKey::AccessGrant((pet_id, grantee.clone()));
+            if grantee == owner {
+                panic_with_error!(&env, ContractError::InvalidInput);
+            }
+
             let now = env.ledger().timestamp();
+            if let Some(ts) = expires_at {
+                if ts <= now {
+                    panic_with_error!(&env, ContractError::InvalidInput);
+                }
+            }
+
+            let key = DataKey::AccessGrant((pet_id, grantee.clone()));
             let mut grant = if let Some(existing) = env
                 .storage()
                 .instance()
@@ -6797,6 +6822,22 @@ impl KoraContract {
     ) -> bool {
         owner.require_auth();
 
+        if name.len() == 0 {
+            panic_with_error!(&env, ContractError::InvalidInput);
+        }
+
+        if name.len() > KoraContract::MAX_STR_SHORT {
+            panic_with_error!(&env, ContractError::InputStringTooLong);
+        }
+
+        if email.len() > KoraContract::MAX_STR_SHORT {
+            panic_with_error!(&env, ContractError::InputStringTooLong);
+        }
+
+        if emergency_contact.len() > KoraContract::MAX_STR_SHORT {
+            panic_with_error!(&env, ContractError::InputStringTooLong);
+        }
+
         if let Some(mut pet_owner) = env
             .storage()
             .instance()
@@ -7009,35 +7050,26 @@ impl KoraContract {
         let count: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::VetCount)
+            .get(&DataKey::VerifiedVetCount)
             .unwrap_or(0);
         let mut result = Vec::new(&env);
-        if count == 0 || limit == 0 {
+        if count == 0 || limit == 0 || offset >= count {
             return result;
         }
-        let mut skipped = 0u64;
-        for i in 1..=count {
+        let start = offset + 1;
+        let end = (offset + limit as u64).min(count);
+        for i in start..=end {
             if let Some(addr) = env
                 .storage()
                 .instance()
-                .get::<DataKey, Address>(&DataKey::VetIndex(i))
+                .get::<DataKey, Address>(&DataKey::VerifiedVetIndex(i))
             {
                 if let Some(vet) = env
                     .storage()
                     .instance()
                     .get::<DataKey, Vet>(&DataKey::Vet(addr))
                 {
-                    if !vet.verified || env.ledger().timestamp() > vet.license_expiry {
-                        continue;
-                    }
-                    if skipped < offset {
-                        skipped += 1;
-                        continue;
-                    }
                     result.push_back(vet);
-                    if result.len() >= limit {
-                        break;
-                    }
                 }
             }
         }
@@ -7073,21 +7105,9 @@ impl KoraContract {
 
         // Process each vet address
         for vet_address in vet_addresses.iter() {
-            // Check if vet exists
-            if let Some(mut vet) = env
-                .storage()
-                .instance()
-                .get::<DataKey, Vet>(&DataKey::Vet(vet_address.clone()))
-            {
-                // Vet exists, verify it
-                vet.verified = true;
-                vet.license_expiry = u64::MAX;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Vet(vet.address.clone()), &vet);
+            if Self::_verify_vet_internal(&env, vet_address.clone()) {
                 succeeded.push_back(vet_address.clone());
             } else {
-                // Vet not found, record failure
                 failed.push_back((vet_address.clone(), ContractError::VetNotFound as u32));
             }
         }
@@ -7165,16 +7185,31 @@ impl KoraContract {
         if let Some(mut vet) = env
             .storage()
             .instance()
-            .get::<DataKey, Vet>(&DataKey::Vet(vet_address))
+            .get::<DataKey, Vet>(&DataKey::Vet(vet_address.clone()))
         {
-            vet.verified = true;
-            vet.license_expiry = u64::MAX;
-            env.storage()
-                .instance()
-                .set(&DataKey::Vet(vet.address.clone()), &vet);
-            env.storage()
-                .instance()
-                .remove(&DataKey::RevokedVet(vet_address));
+            if !vet.verified {
+                vet.verified = true;
+                vet.license_expiry = u64::MAX;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Vet(vet_address.clone()), &vet);
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::RevokedVet(vet_address.clone()));
+
+                let count: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::VerifiedVetCount)
+                    .unwrap_or(0);
+                let new_count = safe_increment(count);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::VerifiedVetCount, &new_count);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::VerifiedVetIndex(new_count), &vet_address);
+            }
             true
         } else {
             false
@@ -7194,15 +7229,57 @@ impl KoraContract {
         if let Some(mut vet) = env
             .storage()
             .instance()
-            .get::<DataKey, Vet>(&DataKey::Vet(vet_address))
+            .get::<DataKey, Vet>(&DataKey::Vet(vet_address.clone()))
         {
-            vet.verified = false;
-            env.storage()
-                .instance()
-                .set(&DataKey::Vet(vet.address.clone()), &vet);
-            env.storage()
-                .instance()
-                .set(&DataKey::RevokedVet(vet_address), &true);
+            if vet.verified {
+                vet.verified = false;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Vet(vet_address.clone()), &vet);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::RevokedVet(vet_address.clone()), &true);
+
+                let count: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::VerifiedVetCount)
+                    .unwrap_or(0);
+
+                let mut remove_index = None;
+                for i in 1..=count {
+                    if let Some(addr) = env
+                        .storage()
+                        .instance()
+                        .get::<DataKey, Address>(&DataKey::VerifiedVetIndex(i))
+                    {
+                        if addr == vet_address {
+                            remove_index = Some(i);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(idx) = remove_index {
+                    if idx != count {
+                        if let Some(last_addr) = env
+                            .storage()
+                            .instance()
+                            .get::<DataKey, Address>(&DataKey::VerifiedVetIndex(count))
+                        {
+                            env.storage()
+                                .instance()
+                                .set(&DataKey::VerifiedVetIndex(idx), &last_addr);
+                        }
+                    }
+                    env.storage()
+                        .instance()
+                        .remove(&DataKey::VerifiedVetIndex(count));
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::VerifiedVetCount, &(count - 1));
+                }
+            }
             true
         } else {
             false
