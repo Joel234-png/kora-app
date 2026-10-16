@@ -999,6 +999,115 @@ describe("KoraRegistry", function () {
         registry.connect(owner).registerPet(PET.name, PET.species, PET.breed, PET.birthday)
       ).to.not.be.reverted;
     });
+
+    // ── Issue #234: comprehensive pause coverage for all whenNotPaused mutators
+
+    it("blocks verifyVet while paused", async function () {
+      await registry.connect(other).registerVet("LIC-002", "Surgery");
+      await registry.connect(admin).pause();
+      await expect(
+        registry.connect(admin).verifyVet(other.address)
+      ).to.be.revertedWithCustomError(registry, "EnforcedPause");
+    });
+
+    it("blocks revokeVet while paused", async function () {
+      await registry.connect(admin).pause();
+      await expect(
+        registry.connect(admin).revokeVet(vet.address)
+      ).to.be.revertedWithCustomError(registry, "EnforcedPause");
+    });
+
+    it("blocks deactivatePet while paused", async function () {
+      const petId = await registerPet();
+      await registry.connect(admin).pause();
+      await expect(
+        registry.connect(owner).deactivatePet(petId)
+      ).to.be.revertedWithCustomError(registry, "EnforcedPause");
+    });
+
+    it("blocks reactivatePet while paused", async function () {
+      const petId = await registerPet();
+      await registry.connect(owner).deactivatePet(petId);
+      await registry.connect(admin).pause();
+      await expect(
+        registry.connect(owner).reactivatePet(petId)
+      ).to.be.revertedWithCustomError(registry, "EnforcedPause");
+    });
+
+    it("blocks updateSpecialization while paused", async function () {
+      await registry.connect(admin).pause();
+      await expect(
+        registry.connect(vet).updateSpecialization("Cardiology")
+      ).to.be.revertedWithCustomError(registry, "EnforcedPause");
+    });
+
+    it("blocks acceptPetTransfer while paused", async function () {
+      const petId = await registerPet();
+      await registry.connect(owner).initiatePetTransfer(petId, other.address);
+      await registry.connect(admin).pause();
+      await expect(
+        registry.connect(other).acceptPetTransfer(petId)
+      ).to.be.revertedWithCustomError(registry, "EnforcedPause");
+    });
+
+    it("blocks cancelPetTransfer while paused", async function () {
+      const petId = await registerPet();
+      await registry.connect(owner).initiatePetTransfer(petId, other.address);
+      await registry.connect(admin).pause();
+      await expect(
+        registry.connect(owner).cancelPetTransfer(petId)
+      ).to.be.revertedWithCustomError(registry, "EnforcedPause");
+    });
+
+    it("verifyVet succeeds after unpause", async function () {
+      await registry.connect(other).registerVet("LIC-002", "Surgery");
+      await registry.connect(admin).pause();
+      await registry.connect(admin).unpause();
+      await expect(registry.connect(admin).verifyVet(other.address)).to.not.be.reverted;
+      expect((await registry.vets(other.address)).isVerified).to.equal(true);
+    });
+
+    it("revokeVet succeeds after unpause", async function () {
+      await registry.connect(admin).pause();
+      await registry.connect(admin).unpause();
+      await expect(registry.connect(admin).revokeVet(vet.address)).to.not.be.reverted;
+      expect((await registry.vets(vet.address)).isRevoked).to.equal(true);
+    });
+
+    it("deactivatePet succeeds after unpause", async function () {
+      const petId = await registerPet();
+      await registry.connect(admin).pause();
+      await registry.connect(admin).unpause();
+      await expect(registry.connect(owner).deactivatePet(petId)).to.not.be.reverted;
+      expect((await registry.pets(petId)).active).to.equal(false);
+    });
+
+    it("reactivatePet succeeds after unpause", async function () {
+      const petId = await registerPet();
+      await registry.connect(owner).deactivatePet(petId);
+      await registry.connect(admin).pause();
+      await registry.connect(admin).unpause();
+      await expect(registry.connect(owner).reactivatePet(petId)).to.not.be.reverted;
+      expect((await registry.pets(petId)).active).to.equal(true);
+    });
+
+    it("addMedicalRecord succeeds after unpause", async function () {
+      const petId = await registerPet();
+      await registry.connect(admin).pause();
+      await registry.connect(admin).unpause();
+      await expect(
+        registry.connect(vet).addMedicalRecord(petId, 0, "flu", "rest", "")
+      ).to.not.be.reverted;
+    });
+
+    it("transferPet (initiate → accept) succeeds after unpause", async function () {
+      const petId = await registerPet();
+      await registry.connect(admin).pause();
+      await registry.connect(admin).unpause();
+      await registry.connect(owner).initiatePetTransfer(petId, other.address);
+      await expect(registry.connect(other).acceptPetTransfer(petId)).to.not.be.reverted;
+      expect((await registry.pets(petId)).owner).to.equal(other.address);
+    });
   });
 
   // ---------------------------------------------------------------------------
