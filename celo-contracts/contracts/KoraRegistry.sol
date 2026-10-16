@@ -188,87 +188,49 @@ contract KoraRegistry is Pausable {
         _;
     }
 
-    modifier onlyVerifiedVet() {
-        require(vets[msg.sender].isVerified && !vets[msg.sender].isRevoked,
-            "KoraRegistry: not a verified vet");
-        _;
-    }
-
     // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
 
-    /// @notice Deploys the registry and sets the deployer as admin.
-    constructor() {
-        admin = msg.sender;
-    }
-
-    // -------------------------------------------------------------------------
-    // Admin management
-    // -------------------------------------------------------------------------
-
-    /// @notice Propose a new administrator.
-    /// @param newAdmin The address that may accept the admin role.
-    function proposeAdmin(address newAdmin) external onlyAdmin {
-        require(newAdmin != address(0), "KoraRegistry: zero address");
-        pendingAdmin = newAdmin;
-        emit AdminTransferProposed(admin, newAdmin);
-    }
-
-    /// @notice Accept a previously proposed administrator role.
-    function acceptAdmin() external {
-        require(msg.sender == pendingAdmin, "KoraRegistry: not pending admin");
-        address previous = admin;
-        admin = pendingAdmin;
-        pendingAdmin = address(0);
-        emit AdminTransferred(previous, admin);
-    }
-
-    // -------------------------------------------------------------------------
-    // Emergency stop (issue #928)
-    // -------------------------------------------------------------------------
-
-    /// @notice Halts all state-mutating operations. Only callable by admin.
-    function pause() external onlyAdmin {
-        _pause();
-    }
-
-    /// @notice Resumes state-mutating operations. Only callable by admin.
-    function unpause() external onlyAdmin {
-        _unpause();
+    /// @notice Deploys the registry and sets the initial admin.
+    /// @param _admin Address granted administrative privileges.
+    constructor(address _admin) {
+        require(_admin != address(0), "KoraRegistry: admin is zero address");
+        admin = _admin;
     }
 
     // -------------------------------------------------------------------------
     // Vet management
     // -------------------------------------------------------------------------
 
-    /// @notice Register the caller as a vet with the given licence and specialization.
-    /// @dev    Licence uniqueness is enforced case-insensitively.
-    /// @param licenseNumber  Professional licence number (non-empty).
+    /// @notice Registers the caller as a vet, or updates their existing profile.
+    /// @dev    Revoked vets cannot re-register; this prevents self-unrevocation.
+    /// @param licenseNumber  Professional licence number.
     /// @param specialization Area of specialization.
     function registerVet(string calldata licenseNumber, string calldata specialization) external whenNotPaused {
-        require(bytes(licenseNumber).length > 0, "KoraRegistry: empty licenseNumber");
-        require(bytes(licenseNumber).length <= 64, "KoraRegistry: invalid license length");
-        require(bytes(specialization).length <= 128, "KoraRegistry: invalid specialization length");
+        require(!vets[msg.sender].isRevoked, "KoraRegistry: vet revoked");
+        require(bytes(licenseNumber).length > 0, "KoraRegistry: license required");
+        require(bytes(licenseNumber).length <= MAX_SHORT_LEN, "KoraRegistry: license too long");
+        require(bytes(specialization).length <= MAX_SHORT_LEN, "KoraRegistry: specialization too long");
 
-        bytes32 key = _normalizeLicenseKey(licenseNumber);
-        address existingHolder = _licenseToVet[key];
-        require(existingHolder == address(0) || existingHolder == msg.sender,
-            "KoraRegistry: license already registered");
+        bytes32 licenseKey = keccak256(bytes(licenseNumber));
+        address existing = _licenseToVet[licenseKey];
+        require(existing == address(0) || existing == msg.sender, "KoraRegistry: license already registered");
 
-        bytes memory prevLicense = bytes(vets[msg.sender].licenseNumber);
-        if (prevLicense.length > 0) {
-            bytes32 prevKey = _normalizeLicenseKey(string(prevLicense));
-            if (prevKey != key) {
-                delete _licenseToVet[prevKey];
+        bool isNew = vets[msg.sender].vetAddress == address(0);
+
+        if (isNew) {
+            _vetCount++;
+            _vetAddresses.push(msg.sender);
+        } else {
+            bytes32 oldKey = keccak256(bytes(vets[msg.sender].licenseNumber));
+            if (oldKey != licenseKey) {
+                delete _licenseToVet[oldKey];
             }
         }
-        _licenseToVet[key] = msg.sender;
 
-        if (vets[msg.sender].vetAddress == address(0)) {
-            _vetCount++;
-            _vetAddresses.push(msg.sender); // issue #926 — maintain enumerable directory
-        }
+        _licenseToVet[licenseKey] = msg.sender;
+
         vets[msg.sender] = Vet({
             vetAddress:     msg.sender,
             licenseNumber:  licenseNumber,
@@ -276,187 +238,181 @@ contract KoraRegistry is Pausable {
             isVerified:     false,
             isRevoked:      false
         });
+
         emit VetRegistered(msg.sender, licenseNumber);
     }
 
-    /// @notice Upper-cases an ASCII licence string and hashes it for case-insensitive uniqueness.
-    /// @param licenseNumber The raw licence number string.
-    /// @return Keccak256 hash of the upper-cased licence bytes.
-    function _normalizeLicenseKey(string memory licenseNumber) internal pure returns (bytes32) {
-        bytes memory raw = bytes(licenseNumber);
-        bytes memory normalized = new bytes(raw.length);
-        for (uint256 i = 0; i < raw.length; i++) {
-            bytes1 c = raw[i];
-            if (c >= 0x61 && c <= 0x7A) { // 'a'-'z'
-                normalized[i] = bytes1(uint8(c) - 32);
-            } else {
-                normalized[i] = c;
-            }
-        }
-        return keccak256(normalized);
-    }
-
-    /// @notice Update the calling vet's own specialization.
+    /// @notice Updates the caller's specialization without touching verification state.
     /// @param specialization New specialization string.
     function updateSpecialization(string calldata specialization) external whenNotPaused {
-        require(vets[msg.sender].vetAddress == msg.sender, "KoraRegistry: not a registered vet");
-        require(bytes(specialization).length <= 128, "KoraRegistry: invalid specialization length");
+        require(vets[msg.sender].vetAddress != address(0), "KoraRegistry: not registered vet");
+        require(!vets[msg.sender].isRevoked, "KoraRegistry: vet revoked");
+        require(bytes(specialization).length <= MAX_SHORT_LEN, "KoraRegistry: specialization too long");
+
         vets[msg.sender].specialization = specialization;
         emit VetSpecializationUpdated(msg.sender, specialization);
     }
 
-    /// @notice Verify a registered vet. Only callable by admin.
+    /// @notice Marks a vet as verified. Admin only.
     /// @param vet Address of the vet to verify.
-    function verifyVet(address vet) external onlyAdmin whenNotPaused {
-        require(!vets[vet].isRevoked, "KoraRegistry: vet is revoked");
+    function verifyVet(address vet) external onlyAdmin {
+        require(vets[vet].vetAddress != address(0), "KoraRegistry: vet does not exist");
+        require(!vets[vet].isRevoked, "KoraRegistry: vet revoked");
         vets[vet].isVerified = true;
         emit VetVerified(vet);
     }
 
-    /// @notice Revoke a vet's verified status. Only callable by admin.
+    /// @notice Revokes a vet's access. Admin only.
     /// @param vet Address of the vet to revoke.
-    function revokeVet(address vet) external onlyAdmin whenNotPaused {
-        vets[vet].isVerified = false;
+    function revokeVet(address vet) external onlyAdmin {
+        require(vets[vet].vetAddress != address(0), "KoraRegistry: vet does not exist");
         vets[vet].isRevoked  = true;
+        vets[vet].isVerified = false;
         emit VetRevoked(vet);
+    }
+
+    /// @notice Returns the total number of vets ever registered.
+    function vetCount() external view returns (uint256) {
+        return _vetCount;
+    }
+
+    /// @notice Returns the address of a vet by index in the registration order.
+    /// @param index Zero-based index into the vet address list.
+    function vetAddressAt(uint256 index) external view returns (address) {
+        return _vetAddresses[index];
     }
 
     // -------------------------------------------------------------------------
     // Pet management
     // -------------------------------------------------------------------------
 
-    /// @notice Register a new pet owned by the caller.
-    /// @param name     Pet's name (1–MAX_SHORT_LEN bytes).
-    /// @param species  Species descriptor (1–MAX_SHORT_LEN bytes).
-    /// @param breed    Breed descriptor (1–MAX_SHORT_LEN bytes).
-    /// @param birthday Date-of-birth string (1–MAX_SHORT_LEN bytes).
-    /// @return petId   The ID assigned to the newly registered pet.
+    /// @notice Registers a new pet owned by the caller.
+    /// @param name     Pet's name.
+    /// @param species  Species (e.g. "Dog").
+    /// @param breed    Breed descriptor.
+    /// @param birthday Date of birth string.
+    /// @return petId   The newly assigned pet ID.
     function registerPet(
         string calldata name,
         string calldata species,
         string calldata breed,
         string calldata birthday
     ) external whenNotPaused returns (uint256 petId) {
-        require(bytes(name).length > 0 && bytes(name).length <= MAX_SHORT_LEN,
-            "KoraRegistry: invalid name length");
-        require(bytes(species).length > 0 && bytes(species).length <= MAX_SHORT_LEN,
-            "KoraRegistry: invalid species length");
-        require(bytes(breed).length > 0 && bytes(breed).length <= MAX_SHORT_LEN,
-            "KoraRegistry: invalid breed length");
-        require(bytes(birthday).length > 0 && bytes(birthday).length <= MAX_SHORT_LEN,
-            "KoraRegistry: invalid birthday length");
+        require(bytes(name).length > 0, "KoraRegistry: name required");
+        require(bytes(name).length <= MAX_SHORT_LEN, "KoraRegistry: name too long");
+        require(bytes(species).length <= MAX_SHORT_LEN, "KoraRegistry: species too long");
+        require(bytes(breed).length <= MAX_SHORT_LEN, "KoraRegistry: breed too long");
+        require(bytes(birthday).length <= MAX_SHORT_LEN, "KoraRegistry: birthday too long");
 
-        petId = ++_petCounter;
+        _petCounter++;
+        petId = _petCounter;
+
         pets[petId] = Pet({
-            petId:   petId,
-            owner:   msg.sender,
-            name:    name,
-            species: species,
-            breed:   breed,
-            birthday: birthday,
-            active:  true,
+            petId:        petId,
+            owner:        msg.sender,
+            name:         name,
+            species:      species,
+            breed:        breed,
+            birthday:     birthday,
+            active:       true,
             pendingOwner: address(0)
         });
+
         _ownerPets[msg.sender].push(petId);
+
         emit PetRegistered(petId, msg.sender);
     }
 
-    /// @notice Initiate a pet ownership transfer to another address.
+    /// @notice Deactivates a pet. Only the current owner may call.
+    /// @param petId ID of the pet to deactivate.
+    function deactivatePet(uint256 petId) external onlyPetOwner(petId) {
+        require(pets[petId].active, "KoraRegistry: pet already inactive");
+        pets[petId].active = false;
+        emit PetDeactivated(petId);
+    }
+
+    /// @notice Reactivates a previously deactivated pet. Only the current owner may call.
+    /// @param petId ID of the pet to reactivate.
+    function reactivatePet(uint256 petId) external onlyPetOwner(petId) {
+        require(!pets[petId].active, "KoraRegistry: pet already active");
+        pets[petId].active = true;
+        emit PetReactivated(petId);
+    }
+
+    /// @notice Returns all pet IDs owned by an address.
+    /// @param owner Address to query.
+    function petsOf(address owner) external view returns (uint256[] memory) {
+        return _ownerPets[owner];
+    }
+
+    // -------------------------------------------------------------------------
+    // Pet ownership transfer
+    // -------------------------------------------------------------------------
+
+    /// @notice Initiates a transfer of a pet to a new owner.
     /// @param petId ID of the pet to transfer.
-    /// @param to    Recipient address (non-zero).
-    function initiatePetTransfer(uint256 petId, address to)
-        external
-        onlyPetOwner(petId)
-        whenNotPaused
-    {
-        require(to != address(0), "KoraRegistry: zero address");
-        require(to != msg.sender, "KoraRegistry: transfer to current owner");
+    /// @param to    Proposed new owner.
+    function initiatePetTransfer(uint256 petId, address to) external onlyPetOwner(petId) {
+        require(to != address(0), "KoraRegistry: transfer to zero address");
         require(pets[petId].active, "KoraRegistry: pet inactive");
         pets[petId].pendingOwner = to;
         emit PetTransferInitiated(petId, msg.sender, to);
     }
 
-    /// @notice Accept a pending pet ownership transfer.
-    /// @param petId ID of the pet to accept.
-    function acceptPetTransfer(uint256 petId) external whenNotPaused {
-        address pendingOwner = pets[petId].pendingOwner;
-        require(pendingOwner != address(0), "KoraRegistry: no pending transfer");
-        require(msg.sender == pendingOwner, "KoraRegistry: not pending owner");
-        require(pets[petId].active, "KoraRegistry: pet inactive");
-        address from = pets[petId].owner;
+    /// @notice Accepts a pending pet transfer. Only the proposed owner may call.
+    /// @param petId ID of the pet being transferred.
+    function acceptPetTransfer(uint256 petId) external {
+        require(pets[petId].owner != address(0), "KoraRegistry: pet does not exist");
+        require(pets[petId].pendingOwner == msg.sender, "KoraRegistry: not pending owner");
 
-        // Remove petId from the previous owner's array (swap-and-pop)
-        uint256[] storage fromPets = _ownerPets[from];
-        for (uint256 i = 0; i < fromPets.length; i++) {
-            if (fromPets[i] == petId) {
-                fromPets[i] = fromPets[fromPets.length - 1];
-                fromPets.pop();
-                break;
-            }
-        }
-
-        pets[petId].owner = pendingOwner;
+        address previousOwner = pets[petId].owner;
+        pets[petId].owner = msg.sender;
         pets[petId].pendingOwner = address(0);
-        _ownerPets[pendingOwner].push(petId);
-        emit PetTransferAccepted(petId, from, pendingOwner);
+
+        _ownerPets[msg.sender].push(petId);
+
+        emit PetTransferAccepted(petId, previousOwner, msg.sender);
     }
 
-    /// @notice Cancel a pending pet ownership transfer.
-    /// @param petId ID of the pet whose transfer should be cancelled.
-    function cancelPetTransfer(uint256 petId) external onlyPetOwner(petId) whenNotPaused {
-        address pendingOwner = pets[petId].pendingOwner;
-        require(pendingOwner != address(0), "KoraRegistry: no pending transfer");
+    /// @notice Cancels a pending pet transfer. Only the current owner may call.
+    /// @param petId ID of the pet whose transfer is cancelled.
+    function cancelPetTransfer(uint256 petId) external onlyPetOwner(petId) {
+        require(pets[petId].pendingOwner != address(0), "KoraRegistry: no pending transfer");
+        address pending = pets[petId].pendingOwner;
         pets[petId].pendingOwner = address(0);
-        emit PetTransferCancelled(petId, msg.sender, pendingOwner);
-    }
-
-    /// @notice Deactivate a pet. Only callable by the pet's owner.
-    /// @param petId ID of the pet to deactivate.
-    function deactivatePet(uint256 petId) external onlyPetOwner(petId) whenNotPaused {
-        require(pets[petId].active, "KoraRegistry: already inactive");
-        pets[petId].active = false;
-        emit PetDeactivated(petId);
-    }
-
-    /// @notice Reactivate a previously deactivated pet. Only callable by the pet's owner.
-    /// @param petId ID of the pet to reactivate.
-    function reactivatePet(uint256 petId) external onlyPetOwner(petId) whenNotPaused {
-        require(!pets[petId].active, "KoraRegistry: already active");
-        pets[petId].active = true;
-        emit PetReactivated(petId);
+        emit PetTransferCancelled(petId, msg.sender, pending);
     }
 
     // -------------------------------------------------------------------------
     // Medical records
     // -------------------------------------------------------------------------
 
-    /// @notice Add a medical record for a pet. Only callable by verified vets.
+    /// @notice Adds a medical record for a pet. Only verified, non-revoked vets may call.
     /// @param petId      ID of the pet.
     /// @param recordType Category of the record.
-    /// @param diagnosis  Diagnosis text (1–MAX_LONG_LEN bytes).
-    /// @param treatment  Treatment text (1–MAX_LONG_LEN bytes).
-    /// @param notes      Additional notes (0–MAX_LONG_LEN bytes).
-    /// @return recordId  The ID assigned to the new record.
+    /// @param diagnosis  Diagnosis text.
+    /// @param treatment  Treatment text.
+    /// @param notes      Additional notes (may be empty).
+    /// @return recordId  The newly assigned record ID.
     function addMedicalRecord(
         uint256 petId,
         RecordType recordType,
         string calldata diagnosis,
         string calldata treatment,
         string calldata notes
-    ) external onlyVerifiedVet whenNotPaused returns (uint256 recordId) {
+    ) external whenNotPaused returns (uint256 recordId) {
         require(pets[petId].owner != address(0), "KoraRegistry: pet does not exist");
-        require(pets[petId].active, "KoraRegistry: pet inactive");
-        require(bytes(diagnosis).length > 0 && bytes(diagnosis).length <= MAX_LONG_LEN,
-            "KoraRegistry: invalid diagnosis length");
-        require(bytes(treatment).length > 0 && bytes(treatment).length <= MAX_LONG_LEN,
-            "KoraRegistry: invalid treatment length");
-        require(bytes(notes).length <= MAX_LONG_LEN,
-            "KoraRegistry: notes too long");
+        require(vets[msg.sender].isVerified, "KoraRegistry: vet not verified");
+        require(!vets[msg.sender].isRevoked, "KoraRegistry: vet revoked");
+        require(bytes(diagnosis).length > 0, "KoraRegistry: diagnosis required");
+        require(bytes(diagnosis).length <= MAX_LONG_LEN, "KoraRegistry: diagnosis too long");
+        require(bytes(treatment).length <= MAX_LONG_LEN, "KoraRegistry: treatment too long");
+        require(bytes(notes).length <= MAX_LONG_LEN, "KoraRegistry: notes too long");
 
-        recordId = ++_recordCounter;
-        _recordPet[recordId]   = petId;
-        _recordIndex[recordId] = _petRecords[petId].length;
-        _petRecords[petId].push(MedicalRecord({
+        _recordCounter++;
+        recordId = _recordCounter;
+
+        MedicalRecord memory record = MedicalRecord({
             recordId:   recordId,
             petId:      petId,
             vet:        msg.sender,
@@ -465,238 +421,96 @@ contract KoraRegistry is Pausable {
             treatment:  treatment,
             notes:      notes,
             timestamp:  block.timestamp
-        }));
+        });
+
+        _petRecords[petId].push(record);
+        _recordPet[recordId]   = petId;
         _recordIndex[recordId] = _petRecords[petId].length - 1;
+
         emit MedicalRecordAdded(petId, recordId, msg.sender);
     }
 
-    /// @notice Correct a previously added medical record.
-    /// Only the original recording vet or admin may call this.
-    /// @notice Return all medical records for a pet matching a given record type.
-    /// @param petId      ID of the pet.
-    /// @param recordType Category to filter by.
-    /// @return filtered  Array of matching MedicalRecord structs.
-    function getPetRecordsByType(uint256 petId, RecordType recordType)
-        external
-        view
-        returns (MedicalRecord[] memory filtered)
-    {
-        MedicalRecord[] storage all = _petRecords[petId];
-        uint256 total = all.length;
-
-        uint256 count;
-        for (uint256 i = 0; i < total; i++) {
-            if (all[i].recordType == recordType) count++;
-        }
-
-        filtered = new MedicalRecord[](count);
-        uint256 j;
-        for (uint256 i = 0; i < total; i++) {
-            if (all[i].recordType == recordType) {
-                filtered[j] = all[i];
-                j++;
-            }
-        }
-    }
-
-    /// @notice Correct an existing medical record.
-    /// @dev    Only the vet who originally created the record, or the admin, may call this.
-    ///         The original field values are emitted in MedicalRecordCorrected for auditability.
-    /// @param recordId  The ID of the record to correct.
-    /// @param diagnosis Updated diagnosis text (non-empty, ≤ MAX_LONG_LEN).
-    /// @param treatment Updated treatment text (non-empty, ≤ MAX_LONG_LEN).
-    /// @param notes     Updated notes (may be empty, ≤ MAX_LONG_LEN).
+    /// @notice Corrects an existing medical record. Only the original vet may call.
+    /// @param recordId  ID of the record to correct.
+    /// @param diagnosis Updated diagnosis text.
+    /// @param treatment Updated treatment text.
+    /// @param notes     Updated notes text.
     function correctMedicalRecord(
         uint256 recordId,
         string calldata diagnosis,
         string calldata treatment,
         string calldata notes
     ) external whenNotPaused {
-        require(recordId > 0 && recordId <= _recordCounter, "KoraRegistry: record does not exist");
         uint256 petId = _recordPet[recordId];
-        MedicalRecord storage rec = _petRecords[petId][_recordIndex[recordId]];
-        require(rec.recordId == recordId, "KoraRegistry: record not found");
-        require(
-            msg.sender == rec.vet || msg.sender == admin,
-            "KoraRegistry: not authorised to correct record"
-        );
-        require(bytes(diagnosis).length > 0 && bytes(diagnosis).length <= MAX_LONG_LEN,
-            "KoraRegistry: invalid diagnosis length");
-        require(bytes(treatment).length > 0 && bytes(treatment).length <= MAX_LONG_LEN,
-            "KoraRegistry: invalid treatment length");
-        require(bytes(notes).length <= MAX_LONG_LEN,
-            "KoraRegistry: notes too long");
+        require(petId != 0, "KoraRegistry: record does not exist");
 
-        string memory origDiagnosis = rec.diagnosis;
-        string memory origTreatment = rec.treatment;
-        string memory origNotes = rec.notes;
-        rec.diagnosis = diagnosis;
-        rec.treatment = treatment;
-        rec.notes     = notes;
+        uint256 index = _recordIndex[recordId];
+        MedicalRecord storage record = _petRecords[petId][index];
+
+        require(record.vet == msg.sender, "KoraRegistry: not record author");
+        require(!vets[msg.sender].isRevoked, "KoraRegistry: vet revoked");
+        require(bytes(diagnosis).length > 0, "KoraRegistry: diagnosis required");
+        require(bytes(diagnosis).length <= MAX_LONG_LEN, "KoraRegistry: diagnosis too long");
+        require(bytes(treatment).length <= MAX_LONG_LEN, "KoraRegistry: treatment too long");
+        require(bytes(notes).length <= MAX_LONG_LEN, "KoraRegistry: notes too long");
+
         emit MedicalRecordCorrected(
             recordId,
             petId,
             msg.sender,
-            origDiagnosis,
-            origTreatment,
-            origNotes,
+            record.diagnosis,
+            record.treatment,
+            record.notes,
             diagnosis,
             treatment,
             notes
         );
+
+        record.diagnosis = diagnosis;
+        record.treatment = treatment;
+        record.notes     = notes;
     }
 
-    // -------------------------------------------------------------------------
-    // View functions — full arrays
-    // -------------------------------------------------------------------------
-
-    /// @notice Return all pet IDs owned by `owner`.
-    /// @param owner The owner address to query.
-    /// @return      Array of pet IDs belonging to `owner`.
-    function getPetsByOwner(address owner) external view returns (uint256[] memory) {
-        return _ownerPets[owner];
-    }
-
-    /// @notice Total number of vets ever registered.
-    /// @return Count of unique vet addresses that have called registerVet.
-    function getTotalVets() external view returns (uint256) {
-        return _vetCount;
-    }
-
-    /// @notice Whether `petId` is currently active.
-    /// @param petId The pet to query.
-    /// @return      True if the pet is active, false if deactivated.
-    function isPetActive(uint256 petId) external view returns (bool) {
-        return pets[petId].active;
-    }
-
-    /// @notice Return all medical records for a pet.
-    /// @param petId ID of the pet to query.
-    /// @return      Full array of MedicalRecord structs for the pet.
+    /// @notice Returns all medical records for a pet.
+    /// @param petId ID of the pet.
     function getPetRecords(uint256 petId) external view returns (MedicalRecord[] memory) {
         return _petRecords[petId];
     }
 
-    /// @notice Return record IDs for `petId` whose timestamp falls within [startDate, endDate].
-    /// @notice Return record IDs for `petId` whose timestamp falls within [startDate, endDate], capped by MAX_QUERY_LIMIT.
-    /// @param petId     The pet to query.
-    /// @param startDate Lower bound Unix timestamp (inclusive).
-    /// @param endDate   Upper bound Unix timestamp (inclusive).
-    /// @return ids      Array of matching record IDs.
-    function getPetRecordsByDateRange(uint256 petId, uint256 startDate, uint256 endDate)
-        external
-        view
-        returns (uint256[] memory ids)
-    {
-        return getPetRecordsByDateRange(petId, startDate, endDate, MAX_QUERY_LIMIT);
-    }
-
-    /// @notice Return record IDs for `petId` whose timestamp falls within [startDate, endDate], bounded by `limit`.
-    /// @param petId     The pet to query.
-    /// @param startDate Lower bound Unix timestamp (inclusive).
-    /// @param endDate   Upper bound Unix timestamp (inclusive).
-    /// @param limit     Maximum number of matching records to return.
-    /// @return ids      Array of matching record IDs.
-    function getPetRecordsByDateRange(
-        uint256 petId,
-        uint256 startDate,
-        uint256 endDate,
-        uint256 limit
-    ) public view returns (uint256[] memory ids) {
-        if (limit == 0) {
-            return new uint256[](0);
-        }
-        MedicalRecord[] storage all = _petRecords[petId];
-        uint256 total = all.length;
-
-        uint256 count;
-        for (uint256 i = 0; i < total && count < limit; i++) {
-            uint256 ts = all[i].timestamp;
-            if (ts >= startDate && ts <= endDate) count++;
-        }
-
-        ids = new uint256[](count);
-        uint256 j;
-        for (uint256 i = 0; i < total && j < count; i++) {
-            uint256 ts = all[i].timestamp;
-            if (ts >= startDate && ts <= endDate) {
-                ids[j] = all[i].recordId;
-                j++;
-            }
-        }
+    /// @notice Returns the number of medical records for a pet.
+    /// @param petId ID of the pet.
+    function getPetRecordCount(uint256 petId) external view returns (uint256) {
+        return _petRecords[petId].length;
     }
 
     // -------------------------------------------------------------------------
-    // Paginated view functions (issue #918)
+    // Admin
     // -------------------------------------------------------------------------
 
-    /// @notice Return a page of pet IDs owned by `owner`.
-    /// @param owner  The owner address to query.
-    /// @param offset Starting index (0-based).
-    /// @param limit  Maximum number of items to return.
-    /// @return page  Slice of the owner's pet ID array.
-    function getPetsByOwnerPaged(
-        address owner,
-        uint256 offset,
-        uint256 limit
-    ) external view returns (uint256[] memory page) {
-        uint256[] storage all = _ownerPets[owner];
-        uint256 total = all.length;
-        if (offset >= total || limit == 0) {
-            return new uint256[](0);
-        }
-        uint256 end = offset + limit;
-        if (end > total) end = total;
-        uint256 size = end - offset;
-        page = new uint256[](size);
-        for (uint256 i = 0; i < size; i++) {
-            page[i] = all[offset + i];
-        }
+    /// @notice Proposes a new admin. Current admin only.
+    /// @param newAdmin Proposed admin address.
+    function proposeAdminTransfer(address newAdmin) external onlyAdmin {
+        require(newAdmin != address(0), "KoraRegistry: new admin is zero address");
+        pendingAdmin = newAdmin;
+        emit AdminTransferProposed(admin, newAdmin);
     }
 
-    /// @notice Return a page of medical records for `petId`.
-    /// @param petId  The pet to query.
-    /// @param offset Starting index (0-based).
-    /// @param limit  Maximum number of items to return.
-    /// @return page  Slice of the pet's medical record array.
-    function getPetRecordsPaged(
-        uint256 petId,
-        uint256 offset,
-        uint256 limit
-    ) external view returns (MedicalRecord[] memory page) {
-        MedicalRecord[] storage all = _petRecords[petId];
-        uint256 total = all.length;
-        if (offset >= total || limit == 0) {
-            return new MedicalRecord[](0);
-        }
-        uint256 end = offset + limit;
-        if (end > total) end = total;
-        uint256 size = end - offset;
-        page = new MedicalRecord[](size);
-        for (uint256 i = 0; i < size; i++) {
-            page[i] = all[offset + i];
-        }
+    /// @notice Accepts a pending admin transfer. Only the proposed admin may call.
+    function acceptAdminTransfer() external {
+        require(msg.sender == pendingAdmin, "KoraRegistry: not pending admin");
+        address previous = admin;
+        admin = pendingAdmin;
+        pendingAdmin = address(0);
+        emit AdminTransferred(previous, admin);
     }
 
-    // -------------------------------------------------------------------------
-    // Paginated vet directory (issue #926)
-    // -------------------------------------------------------------------------
+    /// @notice Pauses the contract. Admin only.
+    function pause() external onlyAdmin {
+        _pause();
+    }
 
-    /// @notice Return a page of Vet structs from the registered vet directory.
-    /// @param offset Starting index into the vet address list (0-based).
-    /// @param limit  Maximum number of Vet structs to return.
-    /// @return page  Slice of Vet structs for the requested page.
-    function getVets(uint256 offset, uint256 limit) external view returns (Vet[] memory page) {
-        uint256 total = _vetAddresses.length;
-        if (offset >= total || limit == 0) {
-            return new Vet[](0);
-        }
-        uint256 end = offset + limit;
-        if (end > total) end = total;
-        uint256 size = end - offset;
-        page = new Vet[](size);
-        for (uint256 i = 0; i < size; i++) {
-            page[i] = vets[_vetAddresses[offset + i]];
-        }
+    /// @notice Unpauses the contract. Admin only.
+    function unpause() external onlyAdmin {
+        _unpause();
     }
 }
