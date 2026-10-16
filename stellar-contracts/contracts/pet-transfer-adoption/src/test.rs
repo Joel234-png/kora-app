@@ -738,6 +738,26 @@ fn reject_adoption_rejects_oversized_reason() {
     );
 }
 
+#[test]
+fn reject_adoption_rejects_empty_reason() {
+    let (env, owner, adopter, pet_id) = setup();
+    let contract_id = env.register_contract(None, PetOwnershipContract);
+    let client = PetOwnershipContractClient::new(&env, &contract_id);
+
+    client.create_pet(&pet_id, &owner);
+    client.sign_adoption(&pet_id, &adopter, &None);
+
+    let empty_reason = String::from_str(&env, "");
+    let result = client.try_reject_adoption(&pet_id, &owner, &empty_reason);
+
+    assert_eq!(
+        result,
+        Err(Ok(Error::from_contract_error(
+            ContractError::InvalidInput as u32,
+        )))
+    );
+}
+
 // ======================================================
 // Escrow + dispute window tests
 // ======================================================
