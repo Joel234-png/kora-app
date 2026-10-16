@@ -189,84 +189,60 @@ contract KoraRegistry is Pausable {
     }
 
     // -------------------------------------------------------------------------
-    // Constructor
+    // Vet functions
     // -------------------------------------------------------------------------
 
-    /// @notice Deploys the registry and sets the initial admin.
-    /// @param _admin Address granted administrative privileges.
-    constructor(address _admin) {
-        require(_admin != address(0), "KoraRegistry: admin is zero address");
-        admin = _admin;
-    }
-
-    // -------------------------------------------------------------------------
-    // Vet management
-    // -------------------------------------------------------------------------
-
-    /// @notice Registers the caller as a vet, or updates their existing profile.
-    /// @dev    Revoked vets cannot re-register; this prevents self-unrevocation.
-    /// @param licenseNumber  Professional licence number.
+    /// @notice Registers the caller as a veterinarian.
+    /// @param licenseNumber  Professional licence number (must be unique).
     /// @param specialization Area of specialization.
     function registerVet(string calldata licenseNumber, string calldata specialization) external whenNotPaused {
-        require(!vets[msg.sender].isRevoked, "KoraRegistry: vet revoked");
+        require(vets[msg.sender].vetAddress == address(0), "KoraRegistry: vet already registered");
         require(bytes(licenseNumber).length > 0, "KoraRegistry: license required");
         require(bytes(licenseNumber).length <= MAX_SHORT_LEN, "KoraRegistry: license too long");
         require(bytes(specialization).length <= MAX_SHORT_LEN, "KoraRegistry: specialization too long");
 
         bytes32 licenseKey = keccak256(bytes(licenseNumber));
-        address existing = _licenseToVet[licenseKey];
-        require(existing == address(0) || existing == msg.sender, "KoraRegistry: license already registered");
-
-        bool isNew = vets[msg.sender].vetAddress == address(0);
-
-        if (isNew) {
-            _vetCount++;
-            _vetAddresses.push(msg.sender);
-        } else {
-            bytes32 oldKey = keccak256(bytes(vets[msg.sender].licenseNumber));
-            if (oldKey != licenseKey) {
-                delete _licenseToVet[oldKey];
-            }
-        }
-
-        _licenseToVet[licenseKey] = msg.sender;
+        require(_licenseToVet[licenseKey] == address(0), "KoraRegistry: license already registered");
 
         vets[msg.sender] = Vet({
-            vetAddress:     msg.sender,
-            licenseNumber:  licenseNumber,
+            vetAddress: msg.sender,
+            licenseNumber: licenseNumber,
             specialization: specialization,
-            isVerified:     false,
-            isRevoked:      false
+            isVerified: false,
+            isRevoked: false
         });
+        _licenseToVet[licenseKey] = msg.sender;
+        _vetAddresses.push(msg.sender);
+        _vetCount++;
 
         emit VetRegistered(msg.sender, licenseNumber);
     }
 
-    /// @notice Updates the caller's specialization without touching verification state.
+    /// @notice Updates the caller's specialization.
     /// @param specialization New specialization string.
-    function updateSpecialization(string calldata specialization) external whenNotPaused {
-        require(vets[msg.sender].vetAddress != address(0), "KoraRegistry: not registered vet");
-        require(!vets[msg.sender].isRevoked, "KoraRegistry: vet revoked");
+    function updateVetSpecialization(string calldata specialization) external whenNotPaused {
+        require(vets[msg.sender].vetAddress != address(0), "KoraRegistry: vet not registered");
+        require(!vets[msg.sender].isRevoked, "KoraRegistry: vet is revoked");
         require(bytes(specialization).length <= MAX_SHORT_LEN, "KoraRegistry: specialization too long");
 
         vets[msg.sender].specialization = specialization;
         emit VetSpecializationUpdated(msg.sender, specialization);
     }
 
-    /// @notice Marks a vet as verified. Admin only.
+    /// @notice Marks a registered vet as verified.
     /// @param vet Address of the vet to verify.
-    function verifyVet(address vet) external onlyAdmin {
-        require(vets[vet].vetAddress != address(0), "KoraRegistry: vet does not exist");
-        require(!vets[vet].isRevoked, "KoraRegistry: vet revoked");
+    function verifyVet(address vet) external onlyAdmin whenNotPaused {
+        require(vets[vet].vetAddress != address(0), "KoraRegistry: vet not registered");
+        require(!vets[vet].isRevoked, "KoraRegistry: vet is revoked");
         vets[vet].isVerified = true;
         emit VetVerified(vet);
     }
 
-    /// @notice Revokes a vet's access. Admin only.
+    /// @notice Revokes a registered vet's access.
     /// @param vet Address of the vet to revoke.
-    function revokeVet(address vet) external onlyAdmin {
-        require(vets[vet].vetAddress != address(0), "KoraRegistry: vet does not exist");
-        vets[vet].isRevoked  = true;
+    function revokeVet(address vet) external onlyAdmin whenNotPaused {
+        require(vets[vet].vetAddress != address(0), "KoraRegistry: vet not registered");
+        vets[vet].isRevoked = true;
         vets[vet].isVerified = false;
         emit VetRevoked(vet);
     }
@@ -276,14 +252,14 @@ contract KoraRegistry is Pausable {
         return _vetCount;
     }
 
-    /// @notice Returns the address of a vet by index in the registration order.
-    /// @param index Zero-based index into the vet address list.
+    /// @notice Returns the address of a vet at a given index in the registration list.
+    /// @param index Index into the ordered vet address list.
     function vetAddressAt(uint256 index) external view returns (address) {
         return _vetAddresses[index];
     }
 
     // -------------------------------------------------------------------------
-    // Pet management
+    // Pet functions
     // -------------------------------------------------------------------------
 
     /// @notice Registers a new pet owned by the caller.
@@ -308,32 +284,31 @@ contract KoraRegistry is Pausable {
         petId = _petCounter;
 
         pets[petId] = Pet({
-            petId:        petId,
-            owner:        msg.sender,
-            name:         name,
-            species:      species,
-            breed:        breed,
-            birthday:     birthday,
-            active:       true,
+            petId: petId,
+            owner: msg.sender,
+            name: name,
+            species: species,
+            breed: breed,
+            birthday: birthday,
+            active: true,
             pendingOwner: address(0)
         });
-
         _ownerPets[msg.sender].push(petId);
 
         emit PetRegistered(petId, msg.sender);
     }
 
-    /// @notice Deactivates a pet. Only the current owner may call.
+    /// @notice Deactivates a pet owned by the caller.
     /// @param petId ID of the pet to deactivate.
-    function deactivatePet(uint256 petId) external onlyPetOwner(petId) {
+    function deactivatePet(uint256 petId) external onlyPetOwner(petId) whenNotPaused {
         require(pets[petId].active, "KoraRegistry: pet already inactive");
         pets[petId].active = false;
         emit PetDeactivated(petId);
     }
 
-    /// @notice Reactivates a previously deactivated pet. Only the current owner may call.
+    /// @notice Reactivates a previously deactivated pet owned by the caller.
     /// @param petId ID of the pet to reactivate.
-    function reactivatePet(uint256 petId) external onlyPetOwner(petId) {
+    function reactivatePet(uint256 petId) external onlyPetOwner(petId) whenNotPaused {
         require(!pets[petId].active, "KoraRegistry: pet already active");
         pets[petId].active = true;
         emit PetReactivated(petId);
@@ -341,54 +316,16 @@ contract KoraRegistry is Pausable {
 
     /// @notice Returns all pet IDs owned by an address.
     /// @param owner Address to query.
-    function petsOf(address owner) external view returns (uint256[] memory) {
+    function getPetsByOwner(address owner) external view returns (uint256[] memory) {
         return _ownerPets[owner];
     }
 
     // -------------------------------------------------------------------------
-    // Pet ownership transfer
+    // Medical record functions
     // -------------------------------------------------------------------------
 
-    /// @notice Initiates a transfer of a pet to a new owner.
-    /// @param petId ID of the pet to transfer.
-    /// @param to    Proposed new owner.
-    function initiatePetTransfer(uint256 petId, address to) external onlyPetOwner(petId) {
-        require(to != address(0), "KoraRegistry: transfer to zero address");
-        require(pets[petId].active, "KoraRegistry: pet inactive");
-        pets[petId].pendingOwner = to;
-        emit PetTransferInitiated(petId, msg.sender, to);
-    }
-
-    /// @notice Accepts a pending pet transfer. Only the proposed owner may call.
-    /// @param petId ID of the pet being transferred.
-    function acceptPetTransfer(uint256 petId) external {
-        require(pets[petId].owner != address(0), "KoraRegistry: pet does not exist");
-        require(pets[petId].pendingOwner == msg.sender, "KoraRegistry: not pending owner");
-
-        address previousOwner = pets[petId].owner;
-        pets[petId].owner = msg.sender;
-        pets[petId].pendingOwner = address(0);
-
-        _ownerPets[msg.sender].push(petId);
-
-        emit PetTransferAccepted(petId, previousOwner, msg.sender);
-    }
-
-    /// @notice Cancels a pending pet transfer. Only the current owner may call.
-    /// @param petId ID of the pet whose transfer is cancelled.
-    function cancelPetTransfer(uint256 petId) external onlyPetOwner(petId) {
-        require(pets[petId].pendingOwner != address(0), "KoraRegistry: no pending transfer");
-        address pending = pets[petId].pendingOwner;
-        pets[petId].pendingOwner = address(0);
-        emit PetTransferCancelled(petId, msg.sender, pending);
-    }
-
-    // -------------------------------------------------------------------------
-    // Medical records
-    // -------------------------------------------------------------------------
-
-    /// @notice Adds a medical record for a pet. Only verified, non-revoked vets may call.
-    /// @param petId      ID of the pet.
+    /// @notice Adds a medical record for a pet. Caller must be a verified, non-revoked vet.
+    /// @param petId      Pet the record belongs to.
     /// @param recordType Category of the record.
     /// @param diagnosis  Diagnosis text.
     /// @param treatment  Treatment text.
@@ -401,9 +338,10 @@ contract KoraRegistry is Pausable {
         string calldata treatment,
         string calldata notes
     ) external whenNotPaused returns (uint256 recordId) {
-        require(pets[petId].owner != address(0), "KoraRegistry: pet does not exist");
+        require(vets[msg.sender].vetAddress != address(0), "KoraRegistry: vet not registered");
         require(vets[msg.sender].isVerified, "KoraRegistry: vet not verified");
-        require(!vets[msg.sender].isRevoked, "KoraRegistry: vet revoked");
+        require(!vets[msg.sender].isRevoked, "KoraRegistry: vet is revoked");
+        require(pets[petId].owner != address(0), "KoraRegistry: pet does not exist");
         require(bytes(diagnosis).length > 0, "KoraRegistry: diagnosis required");
         require(bytes(diagnosis).length <= MAX_LONG_LEN, "KoraRegistry: diagnosis too long");
         require(bytes(treatment).length <= MAX_LONG_LEN, "KoraRegistry: treatment too long");
@@ -413,28 +351,40 @@ contract KoraRegistry is Pausable {
         recordId = _recordCounter;
 
         MedicalRecord memory record = MedicalRecord({
-            recordId:   recordId,
-            petId:      petId,
-            vet:        msg.sender,
+            recordId: recordId,
+            petId: petId,
+            vet: msg.sender,
             recordType: recordType,
-            diagnosis:  diagnosis,
-            treatment:  treatment,
-            notes:      notes,
-            timestamp:  block.timestamp
+            diagnosis: diagnosis,
+            treatment: treatment,
+            notes: notes,
+            timestamp: block.timestamp
         });
 
         _petRecords[petId].push(record);
-        _recordPet[recordId]   = petId;
+        _recordPet[recordId] = petId;
         _recordIndex[recordId] = _petRecords[petId].length - 1;
 
         emit MedicalRecordAdded(petId, recordId, msg.sender);
     }
 
-    /// @notice Corrects an existing medical record. Only the original vet may call.
-    /// @param recordId  ID of the record to correct.
-    /// @param diagnosis Updated diagnosis text.
-    /// @param treatment Updated treatment text.
-    /// @param notes     Updated notes text.
+    /// @notice Returns all medical records for a pet.
+    /// @param petId ID of the pet.
+    function getMedicalRecords(uint256 petId) external view returns (MedicalRecord[] memory) {
+        return _petRecords[petId];
+    }
+
+    /// @notice Returns the number of medical records for a pet.
+    /// @param petId ID of the pet.
+    function getMedicalRecordCount(uint256 petId) external view returns (uint256) {
+        return _petRecords[petId].length;
+    }
+
+    /// @notice Corrects an existing medical record. Caller must be the original vet or the admin.
+    /// @param recordId     ID of the record to correct.
+    /// @param diagnosis    Updated diagnosis text.
+    /// @param treatment    Updated treatment text.
+    /// @param notes        Updated notes text.
     function correctMedicalRecord(
         uint256 recordId,
         string calldata diagnosis,
@@ -447,8 +397,10 @@ contract KoraRegistry is Pausable {
         uint256 index = _recordIndex[recordId];
         MedicalRecord storage record = _petRecords[petId][index];
 
-        require(record.vet == msg.sender, "KoraRegistry: not record author");
-        require(!vets[msg.sender].isRevoked, "KoraRegistry: vet revoked");
+        require(
+            msg.sender == record.vet || msg.sender == admin,
+            "KoraRegistry: not authorized to correct"
+        );
         require(bytes(diagnosis).length > 0, "KoraRegistry: diagnosis required");
         require(bytes(diagnosis).length <= MAX_LONG_LEN, "KoraRegistry: diagnosis too long");
         require(bytes(treatment).length <= MAX_LONG_LEN, "KoraRegistry: treatment too long");
@@ -468,49 +420,84 @@ contract KoraRegistry is Pausable {
 
         record.diagnosis = diagnosis;
         record.treatment = treatment;
-        record.notes     = notes;
-    }
-
-    /// @notice Returns all medical records for a pet.
-    /// @param petId ID of the pet.
-    function getPetRecords(uint256 petId) external view returns (MedicalRecord[] memory) {
-        return _petRecords[petId];
-    }
-
-    /// @notice Returns the number of medical records for a pet.
-    /// @param petId ID of the pet.
-    function getPetRecordCount(uint256 petId) external view returns (uint256) {
-        return _petRecords[petId].length;
+        record.notes = notes;
     }
 
     // -------------------------------------------------------------------------
-    // Admin
+    // Pet transfer functions
     // -------------------------------------------------------------------------
 
-    /// @notice Proposes a new admin. Current admin only.
-    /// @param newAdmin Proposed admin address.
-    function proposeAdminTransfer(address newAdmin) external onlyAdmin {
-        require(newAdmin != address(0), "KoraRegistry: new admin is zero address");
+    /// @notice Initiates transfer of a pet to a new owner.
+    /// @param petId   ID of the pet to transfer.
+    /// @param newOwner Address of the proposed new owner.
+    function initiatePetTransfer(uint256 petId, address newOwner) external onlyPetOwner(petId) whenNotPaused {
+        require(newOwner != address(0), "KoraRegistry: invalid new owner");
+        require(newOwner != msg.sender, "KoraRegistry: cannot transfer to self");
+        pets[petId].pendingOwner = newOwner;
+        emit PetTransferInitiated(petId, msg.sender, newOwner);
+    }
+
+    /// @notice Accepts a pending pet transfer. Caller must be the pending owner.
+    /// @param petId ID of the pet to accept.
+    function acceptPetTransfer(uint256 petId) external whenNotPaused {
+        require(pets[petId].owner != address(0), "KoraRegistry: pet does not exist");
+        require(pets[petId].pendingOwner == msg.sender, "KoraRegistry: not pending owner");
+
+        address previousOwner = pets[petId].owner;
+        pets[petId].owner = msg.sender;
+        pets[petId].pendingOwner = address(0);
+
+        _ownerPets[msg.sender].push(petId);
+
+        emit PetTransferAccepted(petId, previousOwner, msg.sender);
+    }
+
+    /// @notice Cancels a pending pet transfer. Caller must be the current owner.
+    /// @param petId ID of the pet.
+    function cancelPetTransfer(uint256 petId) external onlyPetOwner(petId) whenNotPaused {
+        address pendingOwner = pets[petId].pendingOwner;
+        require(pendingOwner != address(0), "KoraRegistry: no pending transfer");
+        pets[petId].pendingOwner = address(0);
+        emit PetTransferCancelled(petId, msg.sender, pendingOwner);
+    }
+
+    // -------------------------------------------------------------------------
+    // Admin functions
+    // -------------------------------------------------------------------------
+
+    /// @notice Proposes a new admin. The new admin must accept the role.
+    /// @param newAdmin Address of the proposed admin.
+    function proposeAdmin(address newAdmin) external onlyAdmin {
+        require(newAdmin != address(0), "KoraRegistry: invalid admin");
         pendingAdmin = newAdmin;
-        emit AdminTransferProposed(admin, newAdmin);
+        emit AdminTransferProposed(msg.sender, newAdmin);
     }
 
-    /// @notice Accepts a pending admin transfer. Only the proposed admin may call.
-    function acceptAdminTransfer() external {
+    /// @notice Accepts the admin role. Caller must be the pending admin.
+    function acceptAdmin() external {
         require(msg.sender == pendingAdmin, "KoraRegistry: not pending admin");
-        address previous = admin;
-        admin = pendingAdmin;
+        address previousAdmin = admin;
+        admin = msg.sender;
         pendingAdmin = address(0);
-        emit AdminTransferred(previous, admin);
+        emit AdminTransferred(previousAdmin, msg.sender);
     }
 
-    /// @notice Pauses the contract. Admin only.
+    /// @notice Pauses the contract. Only callable by the admin.
     function pause() external onlyAdmin {
         _pause();
     }
 
-    /// @notice Unpauses the contract. Admin only.
+    /// @notice Unpauses the contract. Only callable by the admin.
     function unpause() external onlyAdmin {
         _unpause();
+    }
+
+    // -------------------------------------------------------------------------
+    // Constructor
+    // -------------------------------------------------------------------------
+
+    /// @notice Deploys the registry with the caller as the initial admin.
+    constructor() {
+        admin = msg.sender;
     }
 }
